@@ -85,7 +85,7 @@ def enforce_sibling_center_constraint(
     """
     youth_dict = {youth.name: youth for youth in youth_list}
     for youth in youth_list:
-        for sibling in youth.siblings:
+        for sibling in youth.siblings_list:
             if sibling in youth_dict:
                 for center in centers:
                     model.Add(person_center[youth.name, center.name] == person_center[sibling, center.name])

@@ -35,7 +35,7 @@ def main():
     print('\nInitial Data:')
     print(f'Total youth: {len(youth_list)}')
     print(f'Youth with parents: {len([y for y in youth_list if y.parent_name])}')
-    print(f'Youth with siblings: {len([y for y in youth_list if y.siblings])}')
+    print(f'Youth with siblings: {len([y for y in youth_list if y.siblings_list])}')
     print(f'Centers: {[(c.name, len(c.crews)) for c in centers]}')
 
     cfg = Config.default()

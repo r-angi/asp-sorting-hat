@@ -1,9 +1,10 @@
 from pydantic import BaseModel, Field
+from functools import cached_property
 
 
 class Crew(BaseModel):
     name: str
-    size: int = Field(default=0, init=False)
+    size: int = Field(default=0)
     members: list[str] = Field(default_factory=list)
     adults: list[str]
 
@@ -22,7 +23,7 @@ class Crew(BaseModel):
 class Center(BaseModel):
     name: str
     crews: list[Crew]
-    crew_count: int = Field(default=0, init=False)
+    crew_count: int = Field(default=0)
 
     def __init__(self, name: str, crews: list[Crew]):
         super().__init__(name=name, crews=crews)
@@ -48,44 +49,18 @@ class Youth(Person):
     gender: str
     history: str
     parent_name: str | None = None
-    siblings: list[str]
+    siblings: str | None = None
     first_choice: str | None = None
     second_choice: str | None = None
     third_choice: str | None = None
-    past_leaders: list[str]
+    past_leaders: list[str] = Field(default_factory=list)
     role: str = 'Youth'  # Can be "Youth" or "Young Adult"
 
-    def __init__(
-        self,
-        name: str,
-        year: str,
-        gender: str,
-        history: str,
-        role: str = 'Youth',
-        siblings: str | None = None,
-        parent_name: str | None = None,
-        first_choice: str | None = None,
-        second_choice: str | None = None,
-        third_choice: str | None = None,
-        past_leaders: list[str] = [],
-    ):
-        siblings_list: list[str] = []
-        if siblings is not None:
-            siblings_list = siblings.split('|')
-
-        super().__init__(
-            name=name,
-            year=year,
-            gender=gender,
-            history=history,
-            role=role,
-            siblings=siblings_list,
-            parent_name=parent_name,
-            first_choice=first_choice,
-            second_choice=second_choice,
-            third_choice=third_choice,
-            past_leaders=past_leaders,
-        )
+    @cached_property
+    def siblings_list(self) -> list[str]:
+        if not self.siblings:
+            return []
+        return self.siblings.split('|')
 
 
 class Adult(Person):
