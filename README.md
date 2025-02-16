@@ -2,6 +2,14 @@
 
 This system optimizes the assignment of youth to crews within different centers using Google's OR-Tools CP-SAT solver.
 
+## Background
+
+[Jesse Lee ASP](https://jesseleeasp.org/) is an organization based out of 
+[Jesse Lee Memorial UMC](https://jesseleechurch.com/) in Ridgefield, CT that runs a youth mission trip to Appalachia 
+every year through [Appalachia Service Project (ASP)](https://asphome.org/). Hundreds of youth volunteers join each year
+and need to be assigned to crews across multiple centers with adult leaders. The crew assignment problem is solved 
+through this algorithm.
+
 ## Overview
 
 The system takes youth preferences (buddy forms) and assigns each youth to a crew within a center while optimizing for:
