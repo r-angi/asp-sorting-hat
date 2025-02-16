@@ -1,6 +1,6 @@
 import polars as pl
 from ortools.sat.python import cp_model
-from src.analysis import calculate_friend_scores, calculate_historical_friend_scores
+from src.analysis import calculate_friend_scores
 from src.cleaning import (
     get_centers_from_adults_df,
     get_youth_from_buddy_form_df,
