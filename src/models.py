@@ -37,13 +37,13 @@ class Center(BaseModel):
         self.crew_count -= 1
 
 
-class Person:
+class Person(BaseModel):
     name: str
     center: str | None = None
     crew: str | None = None
 
 
-class Youth(BaseModel, Person):
+class Youth(Person):
     year: str
     gender: str
     history: str
@@ -88,5 +88,5 @@ class Youth(BaseModel, Person):
         )
 
 
-class Adult(BaseModel, Person):
+class Adult(Person):
     children: list[Youth]
