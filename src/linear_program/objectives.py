@@ -9,6 +9,7 @@ def add_friend_preference_objectives(
     youth_list: list[Youth],
     centers: list[Center],
     cfg: Config,
+    youth_dict: dict,
 ) -> list:
     """
     Rewards youth being in the same center as their friend choices.
@@ -22,8 +23,6 @@ def add_friend_preference_objectives(
     Each point is multiplied by the friend_weight from config.
     """
     objective_terms = []
-    youth_dict = {youth.name: youth for youth in youth_list}
-
     for youth in youth_list:
         # Include friend preferences for both youth and young adults
         friend_choices = {
@@ -41,9 +40,14 @@ def add_friend_preference_objectives(
                         if is_ya_in_center:
                             objective_terms.append(cfg.friend_weight * weight * person_center[friend, center.name])
                     else:
+                        # Simplified: reward when both youth and friend are in the same center
+                        # This is equivalent to the multiplication but more efficient
                         same_center = model.NewBoolVar(f'same_center_{youth.name}_{friend}_{center.name}')
-                        model.AddMultiplicationEquality(
-                            same_center, [person_center[youth.name, center.name], person_center[friend, center.name]]
+                        model.Add(same_center <= person_center[youth.name, center.name])
+                        model.Add(same_center <= person_center[friend, center.name])
+                        model.Add(
+                            same_center
+                            >= person_center[youth.name, center.name] + person_center[friend, center.name] - 1
                         )
                         objective_terms.append(cfg.friend_weight * weight * same_center)
 

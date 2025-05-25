@@ -62,6 +62,12 @@ class Youth(Person):
             return []
         return self.siblings.split('|')
 
+    @cached_property
+    def parent_names_list(self) -> list[str]:
+        if not self.parent_name:
+            return []
+        return self.parent_name.split('|')
+
 
 class Adult(Person):
     children: list[Youth]

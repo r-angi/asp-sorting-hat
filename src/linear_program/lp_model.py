@@ -6,6 +6,7 @@ from src.linear_program.constraints import (
     link_crew_and_center_vars,
     enforce_parent_center_constraint,
     enforce_sibling_center_constraint,
+    enforce_sibling_crew_separation_constraint,
     enforce_friend_separation_constraint,
     enforce_friend_center_constraint,
     enforce_crew_size_constraints,
@@ -46,22 +47,27 @@ def create_crew_assignment_model(
                     f'person_{youth.name}_center_{center.name}_crew_{crew.name}'
                 )
 
+    # Pre-compute youth dictionary and filter by role for efficiency
+    youth_dict = {youth.name: youth for youth in youth_list}
+    regular_youth = [youth for youth in youth_list if youth.role == 'Youth']
+
     # Add constraints
     add_one_crew_per_youth(model, person_crew, youth_list, centers)
     link_crew_and_center_vars(model, person_crew, person_center, youth_list, centers)
     enforce_parent_center_constraint(model, person_crew, person_center, youth_list, centers)
-    enforce_sibling_center_constraint(model, person_center, youth_list, centers)
-    enforce_friend_separation_constraint(model, person_crew, youth_list, centers)
-    enforce_friend_center_constraint(model, person_center, youth_list, centers)
-    enforce_crew_size_constraints(model, person_crew, person_center, youth_list, centers, cfg)
+    enforce_sibling_center_constraint(model, person_center, youth_list, centers, youth_dict)
+    enforce_sibling_crew_separation_constraint(model, person_crew, youth_list, centers, youth_dict)
+    enforce_friend_separation_constraint(model, person_crew, youth_list, centers, youth_dict)
+    enforce_friend_center_constraint(model, person_center, youth_list, centers, youth_dict)
+    enforce_crew_size_constraints(model, person_crew, regular_youth, centers, cfg)
     enforce_past_leader_constraint(model, person_crew, youth_list, centers)
 
     # Combine all objective terms
     objective_terms = []
-    objective_terms.extend(add_friend_preference_objectives(model, person_center, youth_list, centers, cfg))
-    objective_terms.extend(add_gender_diversity_objectives(model, person_crew, youth_list, centers, cfg))
-    objective_terms.extend(add_year_diversity_objectives(model, person_crew, youth_list, centers, cfg))
-    objective_terms.extend(add_history_diversity_objectives(model, person_crew, youth_list, centers, cfg))
+    objective_terms.extend(add_friend_preference_objectives(model, person_center, youth_list, centers, cfg, youth_dict))
+    objective_terms.extend(add_gender_diversity_objectives(model, person_crew, regular_youth, centers, cfg))
+    objective_terms.extend(add_year_diversity_objectives(model, person_crew, regular_youth, centers, cfg))
+    objective_terms.extend(add_history_diversity_objectives(model, person_crew, regular_youth, centers, cfg))
 
     model.Maximize(sum(objective_terms))
 

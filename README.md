@@ -28,7 +28,8 @@ The system takes youth preferences (buddy forms) and assigns each youth to a cre
 2. **Family Constraints**
    - Youth must be in the same center as their parent (if they have one)
    - Youth cannot be in the same crew as their parent
-   - Siblings must be assigned to the same center (but can be in different crews)
+   - Siblings must be assigned to the same center
+   - Siblings cannot be in the same crew (to encourage independence)
 
 3. **Friend Management**
    - Friends listed on buddy forms cannot be in the same crew

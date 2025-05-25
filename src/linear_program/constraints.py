@@ -1,5 +1,7 @@
 from ortools.sat.python import cp_model
 from src.models import Youth, Center
+from typing import cast
+from src.config import Config
 
 
 def add_one_crew_per_youth(model: cp_model.CpModel, person_crew: dict, youth_list: list[Youth], centers: list[Center]):
@@ -50,32 +52,46 @@ def enforce_parent_center_constraint(
     centers: list[Center],
 ):
     """
-    Ensures youth are assigned to the same center as their parent, but not the same crew.
+    Ensures youth are assigned to the same center as their parent(s), but not the same crew.
 
     This constraint:
-    1. Forces youth to be in the same center as their parent
+    1. Forces youth to be in the same center as their parent(s)
     2. Prevents youth from being in their parent's crew
     3. Raises an error if a parent is not found in any center
+    4. Assumes all parents of the same child are at the same center (guaranteed by data)
     """
-    adult_names = [adult for center in centers for crew in center.crews for adult in crew.adults]
+    # Pre-compute adult names and their center mappings for efficiency
+    adult_names = set()
+    adult_to_center = {}
+    for center in centers:
+        for crew in center.crews:
+            for adult in crew.adults:
+                adult_names.add(adult)
+                adult_to_center[adult] = center
+
     for youth in youth_list:
-        if youth.parent_name:
-            if youth.parent_name not in adult_names:
-                raise ValueError(f'Parent {youth.parent_name} not found in any center for {youth.name}')
-            for center in centers:
-                parent_in_center = any(youth.parent_name in crew.adults for crew in center.crews)
-                if parent_in_center:
-                    model.Add(person_center[youth.name, center.name] == 1)
-                    # Prevent youth from being in parent's crew
-                    for crew in center.crews:
-                        if youth.parent_name in crew.adults:
-                            model.Add(person_crew[youth.name, center.name, crew.name] == 0)
-                else:
-                    model.Add(person_center[youth.name, center.name] == 0)
+        if youth.parent_names_list:
+            # Check that all parents exist in adult crews
+            for parent_name in youth.parent_names_list:
+                if parent_name not in adult_names:
+                    raise ValueError(f'Parent {parent_name} not found in any center for {youth.name}')
+
+            # Find the center where parents are located (use pre-computed mapping)
+            parent_center = adult_to_center.get(youth.parent_names_list[0])
+
+            if parent_center:
+                # Youth must be assigned to the parent's center
+                model.Add(person_center[youth.name, parent_center.name] == 1)
+
+                # Prevent youth from being in same crew as any parent
+                for crew in parent_center.crews:
+                    for parent_name in youth.parent_names_list:
+                        if parent_name in crew.adults:
+                            model.Add(person_crew[youth.name, parent_center.name, crew.name] == 0)
 
 
 def enforce_sibling_center_constraint(
-    model: cp_model.CpModel, person_center: dict, youth_list: list[Youth], centers: list[Center]
+    model: cp_model.CpModel, person_center: dict, youth_list: list[Youth], centers: list[Center], youth_dict: dict
 ):
     """
     Ensures siblings are assigned to the same center.
@@ -83,7 +99,6 @@ def enforce_sibling_center_constraint(
     This keeps families together at the same worksite while still allowing
     siblings to be in different crews within that center.
     """
-    youth_dict = {youth.name: youth for youth in youth_list}
     for youth in youth_list:
         for sibling in youth.siblings_list:
             if sibling in youth_dict:
@@ -91,32 +106,70 @@ def enforce_sibling_center_constraint(
                     model.Add(person_center[youth.name, center.name] == person_center[sibling, center.name])
 
 
+def enforce_sibling_crew_separation_constraint(
+    model: cp_model.CpModel, person_crew: dict, youth_list: list[Youth], centers: list[Center], youth_dict: dict
+):
+    """
+    Prevents siblings from being assigned to the same crew.
+
+    This ensures that while siblings are at the same center (enforced by
+    enforce_sibling_center_constraint), they are placed in different crews.
+
+    Optimized to avoid duplicate constraints by only processing each sibling pair once.
+    """
+    processed_pairs = set()
+
+    for youth in youth_list:
+        for sibling in youth.siblings_list:
+            if sibling in youth_dict:
+                # Create a canonical pair representation to avoid duplicates
+                pair = tuple(sorted([youth.name, sibling]))
+                if pair not in processed_pairs:
+                    processed_pairs.add(pair)
+
+                    for center in centers:
+                        for crew in center.crews:
+                            model.Add(
+                                person_crew[youth.name, center.name, crew.name]
+                                + person_crew[sibling, center.name, crew.name]
+                                <= 1
+                            )
+
+
 def enforce_friend_separation_constraint(
-    model: cp_model.CpModel, person_crew: dict, youth_list: list[Youth], centers: list[Center]
+    model: cp_model.CpModel, person_crew: dict, youth_list: list[Youth], centers: list[Center], youth_dict: dict
 ):
     """
     Prevents friends from being assigned to the same crew.
 
     This encourages youth to meet new people and prevents cliques from forming.
     It applies to all friend choices (first, second, and third choices).
+
+    Optimized to avoid duplicate constraints by only processing each friend pair once.
     """
-    youth_dict = {youth.name: youth for youth in youth_list}
+    processed_pairs = set()
+
     for youth in youth_list:
         choices = [youth.first_choice, youth.second_choice, youth.third_choice]
         choices = [c for c in choices if c is not None]
         for friend in choices:
             if friend in youth_dict:
-                for center in centers:
-                    for crew in center.crews:
-                        model.Add(
-                            person_crew[youth.name, center.name, crew.name]
-                            + person_crew[friend, center.name, crew.name]
-                            <= 1
-                        )
+                # Create a canonical pair representation to avoid duplicates
+                pair = tuple(sorted([youth.name, cast(str, friend)]))
+                if pair not in processed_pairs:
+                    processed_pairs.add(pair)
+
+                    for center in centers:
+                        for crew in center.crews:
+                            model.Add(
+                                person_crew[youth.name, center.name, crew.name]
+                                + person_crew[friend, center.name, crew.name]
+                                <= 1
+                            )
 
 
 def enforce_friend_center_constraint(
-    model: cp_model.CpModel, person_center: dict, youth_list: list[Youth], centers: list[Center]
+    model: cp_model.CpModel, person_center: dict, youth_list: list[Youth], centers: list[Center], youth_dict: dict
 ):
     """
     Ensures youth are assigned to centers with at least one of their friend choices.
@@ -125,7 +178,6 @@ def enforce_friend_center_constraint(
     friends can't be in the same crew, they will at least be at the same worksite
     and can interact during non-work times.
     """
-    youth_dict = {youth.name: youth for youth in youth_list}
     for youth in youth_list:
         choices = [youth.first_choice, youth.second_choice, youth.third_choice]
         valid_choices = [c for c in choices if c is not None and c in youth_dict]
@@ -138,10 +190,9 @@ def enforce_friend_center_constraint(
 def enforce_crew_size_constraints(
     model: cp_model.CpModel,
     person_crew: dict,
-    person_center: dict,
     youth_list: list[Youth],
     centers: list[Center],
-    config,
+    config: Config,
 ):
     """
     Enforces minimum and maximum crew size constraints.
@@ -154,10 +205,8 @@ def enforce_crew_size_constraints(
     """
     for center in centers:
         for crew in center.crews:
-            # Count regular youth in crew (excluding young adults)
-            youth_in_crew = sum(
-                person_crew[youth.name, center.name, crew.name] for youth in youth_list if youth.role == 'Youth'
-            )
+            # Count regular youth in crew (youth_list is already filtered to regular youth)
+            youth_in_crew = sum(person_crew[youth.name, center.name, crew.name] for youth in youth_list)
 
             # Count all adults (including young adults) in crew
             current_adult_count = len(crew.adults)
@@ -165,11 +214,6 @@ def enforce_crew_size_constraints(
             # Size constraints including adults
             model.Add(youth_in_crew + current_adult_count >= config.min_crew_size)
             model.Add(youth_in_crew + current_adult_count <= config.max_crew_size)
-
-            # Ensure crew assignments are consistent with center assignments
-            for youth in youth_list:
-                if youth.role == 'Youth':
-                    model.Add(person_crew[youth.name, center.name, crew.name] <= person_center[youth.name, center.name])
 
 
 def enforce_past_leader_constraint(
