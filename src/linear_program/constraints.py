@@ -235,3 +235,132 @@ def enforce_past_leader_constraint(
                     # Check if any of youth's past leaders are in this crew
                     if any(leader in crew.adults for leader in youth.past_leaders):
                         model.Add(person_crew[youth.name, center.name, crew.name] == 0)
+
+
+def enforce_supervision_group_limit(
+    model: cp_model.CpModel,
+    person_center: dict,
+    youth_list: list[Youth],
+    centers: list[Center],
+    max_per_center: int = 2,
+):
+    """Limit members of each supervision group to max_per_center per center.
+    
+    Each supervision group (A, B, C, etc.) is constrained independently.
+    Example: With max_per_center=2 and groups A, B:
+      - Center Fayette can have at most 2 from group A AND at most 2 from group B
+    """
+    # Group youth by supervision_group
+    groups: dict[str, list[Youth]] = {}
+    for youth in youth_list:
+        if youth.supervision_group:
+            groups.setdefault(youth.supervision_group, []).append(youth)
+    
+    # Add constraint for each group/center combination
+    for group_name, group_youth in groups.items():
+        for center in centers:
+            model.Add(
+                sum(person_center[y.name, center.name] for y in group_youth)
+                <= max_per_center
+            )
+
+
+def enforce_anti_buddy_constraint(
+    model: cp_model.CpModel,
+    person_center: dict,
+    youth_list: list[Youth],
+    centers: list[Center],
+    youth_dict: dict[str, Youth],
+):
+    """Prevent anti-buddies from being at the same center."""
+    processed_pairs: set[tuple[str, str]] = set()
+    
+    for youth in youth_list:
+        for anti_buddy in youth.anti_buddy_list:
+            if anti_buddy in youth_dict:
+                pair = tuple(sorted([youth.name, anti_buddy]))
+                if pair not in processed_pairs:
+                    processed_pairs.add(pair)
+                    for center in centers:
+                        model.Add(
+                            person_center[youth.name, center.name]
+                            + person_center[anti_buddy, center.name] <= 1
+                        )
+
+
+def assign_center_only_adults(
+    model: cp_model.CpModel,
+    adult_crew: dict,
+    center_only_adults: list[tuple[str, str]],  # (name, center)
+    centers: list[Center],
+):
+    """Assign center-only adults to exactly one crew within their center.
+    
+    These are adults who are pre-assigned to a center but not a specific crew.
+    The algorithm will assign them to exactly one crew in their center.
+    """
+    for adult_name, center_name in center_only_adults:
+        center = next(c for c in centers if c.name == center_name)
+        # Must be assigned to exactly one crew in their center
+        model.Add(
+            sum(adult_crew[adult_name, center_name, crew.name] 
+                for crew in center.crews) == 1
+        )
+
+
+def assign_unassigned_adults(
+    model: cp_model.CpModel,
+    adult_crew: dict,
+    unassigned_adults: list[str],
+    centers: list[Center],
+):
+    """Assign unassigned adults to exactly one crew across all centers.
+    
+    These are adults with no center or crew assignment.
+    The algorithm will assign them to any crew in any center.
+    """
+    for adult_name in unassigned_adults:
+        # Must be assigned to exactly one crew across all centers
+        model.Add(
+            sum(adult_crew[adult_name, center.name, crew.name]
+                for center in centers
+                for crew in center.crews) == 1
+        )
+
+
+def enforce_adult_count_constraints(
+    model: cp_model.CpModel,
+    adult_crew: dict,
+    center_only_adults: list[tuple[str, str]],
+    unassigned_adults: list[str],
+    centers: list[Center],
+    config: Config,
+):
+    """Enforce minimum and maximum adult count per crew.
+    
+    Ensures each crew has adequate supervision (min) without too many leaders (max).
+    Counts pre-assigned adults, center-only adults, and unassigned adults.
+    """
+    for center in centers:
+        for crew in center.crews:
+            # Count pre-assigned adults in this crew
+            pre_assigned_count = len(crew.adults)
+            
+            # Count center-only adults that could be assigned to this crew
+            center_only_in_crew = sum(
+                adult_crew[adult_name, center.name, crew.name]
+                for adult_name, center_name in center_only_adults
+                if center_name == center.name
+            )
+            
+            # Count unassigned adults that could be assigned to this crew
+            unassigned_in_crew = sum(
+                adult_crew[adult_name, center.name, crew.name]
+                for adult_name in unassigned_adults
+            )
+            
+            total_adults = pre_assigned_count + center_only_in_crew + unassigned_in_crew
+            
+            # Enforce min/max adult constraints
+            model.Add(total_adults >= config.min_adults_per_crew)
+            model.Add(total_adults <= config.max_adults_per_crew)

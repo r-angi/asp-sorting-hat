@@ -11,6 +11,11 @@ from src.linear_program.constraints import (
     enforce_friend_center_constraint,
     enforce_crew_size_constraints,
     enforce_past_leader_constraint,
+    enforce_supervision_group_limit,
+    enforce_anti_buddy_constraint,
+    assign_center_only_adults,
+    assign_unassigned_adults,
+    enforce_adult_count_constraints,
 )
 from src.linear_program.objectives import (
     add_friend_preference_objectives,
@@ -21,11 +26,19 @@ from src.linear_program.objectives import (
 
 
 def create_crew_assignment_model(
-    cfg: Config, youth_list: list[Youth], centers: list[Center]
-) -> tuple[cp_model.CpModel, dict, dict]:
+    cfg: Config,
+    youth_list: list[Youth],
+    centers: list[Center],
+    center_only_adults: list[tuple[str, str]] | None = None,
+    unassigned_adults: list[str] | None = None,
+) -> tuple[cp_model.CpModel, dict, dict, dict]:
     print(f'Youth count: {len(youth_list)}')
     print(f'Centers: {[c.name for c in centers]}')
     print(f'Total crews: {sum(len(c.crews) for c in centers)}')
+    if center_only_adults:
+        print(f'Center-only adults: {len(center_only_adults)}')
+    if unassigned_adults:
+        print(f'Unassigned adults: {len(unassigned_adults)}')
 
     model = cp_model.CpModel()
 
@@ -47,6 +60,25 @@ def create_crew_assignment_model(
                     f'person_{youth.name}_center_{center.name}_crew_{crew.name}'
                 )
 
+    # Create variables for center-only adults if any
+    adult_crew = {}
+    if center_only_adults:
+        for adult_name, center_name in center_only_adults:
+            center = next(c for c in centers if c.name == center_name)
+            for crew in center.crews:
+                adult_crew[(adult_name, center_name, crew.name)] = model.NewBoolVar(
+                    f'adult_{adult_name}_center_{center_name}_crew_{crew.name}'
+                )
+    
+    # Create variables for unassigned adults (can go to any center/crew)
+    if unassigned_adults:
+        for adult_name in unassigned_adults:
+            for center in centers:
+                for crew in center.crews:
+                    adult_crew[(adult_name, center.name, crew.name)] = model.NewBoolVar(
+                        f'adult_{adult_name}_center_{center.name}_crew_{crew.name}'
+                    )
+
     # Pre-compute youth dictionary and filter by role for efficiency
     youth_dict = {youth.name: youth for youth in youth_list}
     regular_youth = [youth for youth in youth_list if youth.role == 'Youth']
@@ -61,6 +93,26 @@ def create_crew_assignment_model(
     enforce_friend_center_constraint(model, person_center, youth_list, centers, youth_dict)
     enforce_crew_size_constraints(model, person_crew, regular_youth, centers, cfg)
     enforce_past_leader_constraint(model, person_crew, youth_list, centers)
+    enforce_supervision_group_limit(model, person_center, youth_list, centers)
+    enforce_anti_buddy_constraint(model, person_center, youth_list, centers, youth_dict)
+    
+    # Handle center-only adults
+    if center_only_adults:
+        assign_center_only_adults(model, adult_crew, center_only_adults, centers)
+    
+    # Handle unassigned adults
+    if unassigned_adults:
+        assign_unassigned_adults(model, adult_crew, unassigned_adults, centers)
+    
+    # Enforce adult count constraints (always, even if no flexible adults)
+    enforce_adult_count_constraints(
+        model, 
+        adult_crew, 
+        center_only_adults or [], 
+        unassigned_adults or [], 
+        centers, 
+        cfg
+    )
 
     # Combine all objective terms
     objective_terms = []
@@ -71,4 +123,4 @@ def create_crew_assignment_model(
 
     model.Maximize(sum(objective_terms))
 
-    return model, person_center, person_crew
+    return model, person_center, person_crew, adult_crew

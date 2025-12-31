@@ -55,6 +55,8 @@ class Youth(Person):
     third_choice: str | None = None
     past_leaders: list[str] = Field(default_factory=list)
     role: str = 'Youth'  # Can be "Youth" or "Young Adult"
+    supervision_group: str | None = None  # Group identifier for max 2 per center constraint
+    anti_buddy: str | None = None  # Pipe-separated list of people who cannot be at same center
 
     @cached_property
     def siblings_list(self) -> list[str]:
@@ -67,6 +69,12 @@ class Youth(Person):
         if not self.parent_name:
             return []
         return self.parent_name.split('|')
+
+    @cached_property
+    def anti_buddy_list(self) -> list[str]:
+        if not self.anti_buddy:
+            return []
+        return self.anti_buddy.split('|')
 
 
 class Adult(Person):

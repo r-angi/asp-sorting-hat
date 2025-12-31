@@ -10,6 +10,9 @@ def write_results_to_csv(
     youth_list: list[Youth],
     centers: list[Center],
     year: int,
+    adult_crew: dict[tuple[str, str, str], int] | None = None,
+    unassigned_adults: list[str] | None = None,
+    center_only_adults: list[tuple[str, str]] | None = None,
 ) -> None:
     """Write all assignments and participant info to a CSV file."""
     output_path = f'./data/results/assignments_{year}.csv'
@@ -38,7 +41,7 @@ def write_results_to_csv(
                     }
                 )
 
-            # Add adults in this crew
+            # Add pre-assigned adults in this crew
             for adult in crew.adults:
                 rows.append(
                     {
@@ -51,6 +54,41 @@ def write_results_to_csv(
                         'History': '',
                     }
                 )
+            
+            # Add center-only adults assigned to this crew
+            if adult_crew and center_only_adults:
+                for adult_name, assigned_center in center_only_adults:
+                    if assigned_center == center.name:
+                        if (adult_name, center.name, crew.name) in adult_crew:
+                            if solver.Value(adult_crew[adult_name, center.name, crew.name]) == 1:
+                                rows.append(
+                                    {
+                                        'Center': center.name,
+                                        'Crew': crew.name,
+                                        'Name': adult_name,
+                                        'Role': 'Adult',
+                                        'Gender': '',
+                                        'Year': '',
+                                        'History': '',
+                                    }
+                                )
+            
+            # Add unassigned adults assigned to this crew
+            if adult_crew and unassigned_adults:
+                for adult_name in unassigned_adults:
+                    if (adult_name, center.name, crew.name) in adult_crew:
+                        if solver.Value(adult_crew[adult_name, center.name, crew.name]) == 1:
+                            rows.append(
+                                {
+                                    'Center': center.name,
+                                    'Crew': crew.name,
+                                    'Name': adult_name,
+                                    'Role': 'Adult',
+                                    'Gender': '',
+                                    'Year': '',
+                                    'History': '',
+                                }
+                            )
 
     # Convert to DataFrame and write to CSV
     results_df = pl.DataFrame(rows)
