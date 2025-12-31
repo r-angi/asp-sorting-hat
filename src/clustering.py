@@ -103,7 +103,13 @@ def visualize_cluster_distribution(
     youth_list: list[Youth],
     output_path: str = 'cluster_analysis.png',
 ):
-    """Create comprehensive visualization showing cluster distribution, network, and name lists."""
+    """Create comprehensive 4-panel visualization of friend clusters and center assignments.
+
+    Panel 1: Bar chart showing cluster distribution across centers with cohesion scores
+    Panel 2: Network graph showing friend connections, colored by center assignment
+    Panel 3: Grid of clusters (5 per row), each showing members colored by center
+    Panel 4: Columns of centers (side-by-side), each showing members colored by cluster
+    """
     # Get unique cluster IDs and sort by size
     cluster_sizes = [(cid, data['size']) for cid, data in cohesion_data.items()]
     cluster_sizes.sort(key=lambda x: x[1], reverse=True)
@@ -122,9 +128,38 @@ def visualize_cluster_distribution(
                 name_to_center[youth.name] = center.name
                 break
 
-    # Create multi-panel figure
-    fig = plt.figure(figsize=(20, 24))
-    gs = fig.add_gridspec(3, 1, height_ratios=[1, 2, 1.5], hspace=0.3)
+    # Build cluster members dict for layout calculations
+    cluster_members: dict[int, list[str]] = defaultdict(list)
+    for name, cluster_id in clusters.items():
+        cluster_members[cluster_id].append(name)
+
+    # Calculate dynamic heights based on content
+    clusters_per_row = 5
+    num_cluster_rows = int(np.ceil(len(cluster_members) / clusters_per_row))
+    max_cluster_size = max(len(members) for members in cluster_members.values())
+
+    # For centers: find the tallest center column
+    max_center_size = max(len([n for n, c in name_to_center.items() if c == cn]) for cn in center_names)
+
+    # Calculate inches needed for each panel
+    bar_chart_height = 6  # More space for bar chart
+    network_height = 10  # More space for network graph
+    # Clusters: each row needs space for title + members
+    clusters_height = max(6, num_cluster_rows * (max_cluster_size * 0.15 + 0.6))
+    # Centers: need to account for cluster sub-headers within each center
+    # Estimate: max center size + extra for cluster grouping overhead
+    num_unique_clusters = len(set(clusters.values()))
+    # Assume clusters are somewhat evenly distributed, add overhead per estimated cluster per center
+    estimated_clusters_per_center = max(3, num_unique_clusters // len(center_names))
+    # Revert to reasonable height
+    centers_height = max(14, max_center_size * 0.25 + estimated_clusters_per_center * 0.3 + 3)
+
+    # Total figure height with spacing
+    total_height = bar_chart_height + network_height + clusters_height + centers_height + 2
+
+    # Use reasonable ratios that preserve proportions
+    fig = plt.figure(figsize=(24, total_height))
+    gs = fig.add_gridspec(4, 1, height_ratios=[bar_chart_height, network_height, clusters_height, centers_height], hspace=0.15)
 
     # ===== PANEL 1: Bar Chart =====
     ax_bar = fig.add_subplot(gs[0])
@@ -165,32 +200,59 @@ def visualize_cluster_distribution(
     # Build directed graph
     G = _build_friend_graph(youth_list)
 
-    # Create cluster-based layout with initial positions
-    cluster_members: dict[int, list[str]] = defaultdict(list)
-    for name, cluster_id in clusters.items():
-        cluster_members[cluster_id].append(name)
-
-    # Position clusters in a grid
+    # Position clusters in a grid with boundaries
     pos = {}
     num_clusters = len(cluster_members)
     cols = int(np.ceil(np.sqrt(num_clusters)))
+    cluster_positions = {}  # Store cluster centers for labels
 
     for idx, (cluster_id, members) in enumerate(sorted(cluster_members.items(), key=lambda x: len(x[1]), reverse=True)):
         row = idx // cols
         col = idx % cols
         center_x = col * 10
         center_y = -row * 10
+        cluster_positions[cluster_id] = (center_x, center_y)
 
         # Create subgraph for this cluster
         subgraph = G.subgraph(members)
         if len(members) > 1:
-            sub_pos = nx.spring_layout(subgraph, k=0.5, iterations=50, seed=42)
+            sub_pos = nx.spring_layout(subgraph, k=1.2, iterations=50, seed=42)
             # Scale and translate
             for node in sub_pos:
-                pos[node] = (center_x + sub_pos[node][0] * 3, center_y + sub_pos[node][1] * 3)
+                pos[node] = (center_x + sub_pos[node][0] * 4, center_y + sub_pos[node][1] * 4)
         else:
             # Single node
             pos[members[0]] = (center_x, center_y)
+
+    # Draw cluster boundaries (subtle rectangles)
+    for idx, (cluster_id, members) in enumerate(sorted(cluster_members.items(), key=lambda x: len(x[1]), reverse=True)):
+        if len(members) == 0:
+            continue
+        # Get bounding box for cluster
+        member_positions = [pos[m] for m in members if m in pos]
+        if member_positions:
+            xs = [p[0] for p in member_positions]
+            ys = [p[1] for p in member_positions]
+            min_x, max_x = min(xs) - 1, max(xs) + 1
+            min_y, max_y = min(ys) - 1, max(ys) + 1
+            width = max_x - min_x
+            height = max_y - min_y
+
+            # Draw boundary rectangle
+            rect = plt.Rectangle((min_x, min_y), width, height, facecolor='lightgray', edgecolor='darkgray', linewidth=1.5, alpha=0.15, zorder=0)
+            ax_network.add_patch(rect)
+
+            # Add cluster label
+            cluster_label = f'C{idx + 1}'
+            ax_network.text(
+                min_x + width / 2,
+                max_y + 0.3,
+                cluster_label,
+                fontsize=9,
+                ha='center',
+                weight='bold',
+                bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.7, edgecolor='gray'),
+            )
 
     # Draw nodes colored by center assignment
     for center_name, color in center_color_map.items():
@@ -202,8 +264,8 @@ def visualize_cluster_distribution(
         weight = G[edge[0]][edge[1]]['weight']
         nx.draw_networkx_edges(G, pos, edgelist=[edge], width=weight * 0.5, alpha=0.3, arrows=True, arrowsize=10, ax=ax_network, edge_color='gray')
 
-    # Draw labels
-    nx.draw_networkx_labels(G, pos, font_size=7, font_weight='bold', ax=ax_network)
+    # Draw labels with smaller font and background
+    nx.draw_networkx_labels(G, pos, font_size=5, font_weight='normal', ax=ax_network)
 
     ax_network.set_title('Social Network: Friend Choices (colored by center assignment)', fontsize=14, pad=20)
     ax_network.axis('off')
@@ -214,33 +276,214 @@ def visualize_cluster_distribution(
     ]
     ax_network.legend(handles=legend_elements, loc='upper right', fontsize=10)
 
-    # ===== PANEL 3: Name Lists =====
-    ax_names = fig.add_subplot(gs[2])
-    ax_names.axis('off')
+    # ===== PANEL 3: CLUSTERS Grid Layout =====
+    ax_clusters = fig.add_subplot(gs[2])
+    ax_clusters.axis('off')
+    ax_clusters.set_xlim(0, 1)
+    ax_clusters.set_ylim(0, 1)
 
-    # Build text for left column (grouped by cluster)
-    left_text = 'BY CLUSTER (colored by center):\n' + '=' * 40 + '\n'
+    # Create cluster color map (generate distinct colors for clusters)
+    cluster_color_map = {}
+    unique_clusters = sorted(set(clusters.values()))
+
+    # Use multiple colormaps to ensure enough distinct colors
+    if len(unique_clusters) <= 20:
+        cluster_colors_palette = plt.cm.tab20(np.linspace(0, 1, len(unique_clusters)))
+    else:
+        # Combine tab20 with tab20b and tab20c for more colors
+        colors1 = plt.cm.tab20(np.linspace(0, 1, 20))
+        colors2 = plt.cm.tab20b(np.linspace(0, 1, min(20, len(unique_clusters) - 20)))
+        if len(unique_clusters) > 40:
+            colors3 = plt.cm.tab20c(np.linspace(0, 1, len(unique_clusters) - 40))
+            cluster_colors_palette = np.vstack([colors1, colors2, colors3])
+        else:
+            cluster_colors_palette = np.vstack([colors1, colors2])
+
+    for i, cluster_id in enumerate(unique_clusters):
+        cluster_color_map[cluster_id] = cluster_colors_palette[i]
+
+    # Title for clusters panel
+    ax_clusters.text(
+        0.5, 0.98, 'CLUSTERS (boxes colored by center assignment)', fontsize=11, weight='bold', transform=ax_clusters.transAxes, ha='center'
+    )
+
+    # Layout configuration for cluster grid (clusters_per_row already defined above)
+    col_width = 1.0 / clusters_per_row
+    box_height = 0.01
+    box_width = col_width * 0.9  # Leave some margin
+
+    y_start = 0.93
+    row_start_y = y_start  # Track where each row starts
+    row_min_y = {}  # Track the minimum y for each row (to know where next row should start)
+
     for idx, cluster_id in enumerate(cluster_ids):
+        col = idx % clusters_per_row
+        row = idx // clusters_per_row
+
+        x_base = col * col_width + 0.01
+
         cluster_label = f'C{idx + 1}'
         cluster_num = int(cluster_id.split('_')[1])
         members = sorted(cluster_members[cluster_num])
-        left_text += f'\n{cluster_label} ({len(members)} members):\n'
-        for name in members:
-            left_text += f'  {name}\n'
 
-    # Build text for right column (grouped by center)
-    right_text = 'BY CENTER (colored by cluster):\n' + '=' * 40 + '\n'
-    for center_name in center_names:
-        names_in_center = sorted([name for name, center in name_to_center.items() if center == center_name])
-        right_text += f'\n{center_name} ({len(names_in_center)} youth):\n'
+        # Calculate y position for this cluster
+        if col == 0:
+            # Start a new row - position it below the previous row's longest cluster
+            if row > 0:
+                row_start_y = row_min_y.get(row - 1, row_start_y) - 0.03
+            row_min_y[row] = row_start_y
+
+        y_pos = row_start_y
+
+        # Cluster header
+        ax_clusters.text(
+            x_base + box_width / 2,
+            y_pos,
+            f'{cluster_label} ({len(members)})',
+            fontsize=7,
+            weight='bold',
+            transform=ax_clusters.transAxes,
+            ha='center',
+        )
+
+        y_current = y_pos - 0.015
+
+        # Draw each member as a colored box
+        for name in members:
+            center = name_to_center.get(name)
+            color = center_color_map.get(center, 'gray') if center else 'gray'
+
+            # Draw rectangle
+            rect = plt.Rectangle(
+                (x_base, y_current - box_height / 2),
+                box_width,
+                box_height,
+                facecolor=color,
+                edgecolor='black',
+                linewidth=0.5,
+                transform=ax_clusters.transAxes,
+                alpha=0.9,
+            )
+            ax_clusters.add_patch(rect)
+
+            # Draw name on top of rectangle
+            ax_clusters.text(
+                x_base + box_width / 2, y_current, name, fontsize=5, ha='center', va='center', transform=ax_clusters.transAxes, color='black'
+            )
+            y_current -= 0.012
+
+        # Update the minimum y for this row
+        row_min_y[row] = min(row_min_y.get(row, y_current), y_current)
+
+    # ===== PANEL 4: CENTERS Layout =====
+    ax_centers = fig.add_subplot(gs[3])
+    ax_centers.axis('off')
+    ax_centers.set_xlim(0, 1)
+    ax_centers.set_ylim(0, 1)
+
+    # Title for centers panel
+    ax_centers.text(0.5, 0.98, 'CENTERS (boxes colored by cluster)', fontsize=11, weight='bold', transform=ax_centers.transAxes, ha='center')
+
+    # Layout configuration for center columns
+    num_centers = len(center_names)
+    center_col_width = 1.0 / num_centers
+    center_box_width = center_col_width * 0.9
+    centers_y_start = 0.96  # Start higher to use more available space
+
+    # Draw each center as a column, grouped by cluster
+    for center_idx, center_name in enumerate(center_names):
+        x_base = center_idx * center_col_width + 0.01
+        names_in_center = [name for name, center in name_to_center.items() if center == center_name]
+
+        # Group names by cluster
+        center_clusters: dict[int, list[str]] = defaultdict(list)
         for name in names_in_center:
             cluster_id = clusters.get(name, -1)
-            cluster_label = f'C{list(cluster_members.keys()).index(cluster_id) + 1}' if cluster_id in cluster_members else '?'
-            right_text += f'  {name} [{cluster_label}]\n'
+            center_clusters[cluster_id].append(name)
 
-    # Display text in two columns
-    ax_names.text(0.02, 0.98, left_text, transform=ax_names.transAxes, fontsize=8, verticalalignment='top', family='monospace')
-    ax_names.text(0.52, 0.98, right_text, transform=ax_names.transAxes, fontsize=8, verticalalignment='top', family='monospace')
+        # Sort clusters by size (largest first) and then by cluster_id
+        sorted_clusters = sorted(center_clusters.items(), key=lambda x: (-len(x[1]), x[0]))
+
+        # Center header
+        y_current = centers_y_start
+        ax_centers.text(
+            x_base + center_box_width / 2,
+            y_current,
+            f'{center_name} ({len(names_in_center)})',
+            fontsize=7,
+            weight='bold',
+            transform=ax_centers.transAxes,
+            ha='center',
+        )
+
+        y_current -= 0.025  # Reduced from 0.03
+
+        # Draw each cluster group within this center
+        for cluster_id, cluster_names in sorted_clusters:
+            # Get cluster label and color
+            if cluster_id != -1 and cluster_id in cluster_color_map:
+                color = cluster_color_map[cluster_id]
+                # Find cluster display label
+                cluster_label = None
+                for idx, cid in enumerate(cluster_ids):
+                    if int(cid.split('_')[1]) == cluster_id:
+                        cluster_label = f'C{idx + 1}'
+                        break
+                if not cluster_label:
+                    cluster_label = 'C?'
+            else:
+                color = 'lightgray'
+                cluster_label = 'Other'
+
+            # Cluster sub-header
+            ax_centers.text(
+                x_base + center_box_width / 2,
+                y_current,
+                f'{cluster_label}',
+                fontsize=6,
+                weight='bold',
+                style='italic',
+                transform=ax_centers.transAxes,
+                ha='center',
+                color='darkgray',
+            )
+            y_current -= 0.015  # Reduced from 0.018
+
+            # Draw each member in this cluster (alphabetically)
+            for name in sorted(cluster_names):
+                # Check if we have enough space (bottom of box should stay above 0.01)
+                if y_current - box_height / 2 < 0.01:
+                    print(f'Warning: Ran out of space in {center_name} column. Increase centers_height.')
+                    break
+
+                # Draw rectangle
+                rect = plt.Rectangle(
+                    (x_base, y_current - box_height / 2),
+                    center_box_width,
+                    box_height,
+                    facecolor=color,
+                    edgecolor='black',
+                    linewidth=0.5,
+                    transform=ax_centers.transAxes,
+                    alpha=0.9,
+                )
+                ax_centers.add_patch(rect)
+
+                # Draw name on top of rectangle
+                ax_centers.text(
+                    x_base + center_box_width / 2,
+                    y_current,
+                    name,
+                    fontsize=5,
+                    ha='center',
+                    va='center',
+                    transform=ax_centers.transAxes,
+                    color='black',
+                )
+                y_current -= 0.0095  # Reduced from 0.012 to fit more names
+
+            # Add small spacing between cluster groups
+            y_current -= 0.008
 
     plt.savefig(output_path, dpi=300, bbox_inches='tight')
     plt.close()

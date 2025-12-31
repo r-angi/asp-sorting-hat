@@ -19,14 +19,15 @@ from src.writer import write_results_to_csv
 
 
 class MockSolver:
-    """Mock solver that returns values from a dict, compatible with cp_model.CpSolver interface."""
+    """Mock solver that returns values directly, compatible with cp_model.CpSolver interface.
 
-    def __init__(self, person_crew: dict[tuple[str, str, str], int]):
-        self.person_crew = person_crew
+    In the optimization path, person_crew contains CP-SAT variables and solver.Value() extracts their values.
+    In the mock path, person_crew contains integers directly, so Value() just returns them as-is.
+    """
 
-    def Value(self, var: tuple[str, str, str]) -> int:
-        """Return value from the person_crew dict."""
-        return self.person_crew.get(var, 0)
+    def Value(self, var: int) -> int:
+        """Return the value as-is since person_crew already contains integers, not variables."""
+        return var
 
 
 def load_existing_assignments(year: int, youth_list: list[Youth], centers: list[Center]) -> dict[tuple[str, str, str], int]:
@@ -54,7 +55,7 @@ def analyze_existing_assignments(year: int, youth_list: list[Youth], centers: li
 
     # Load existing assignments from CSV
     person_crew = load_existing_assignments(year, youth_list, centers)
-    solver = MockSolver(person_crew)
+    solver = MockSolver()
 
     # Print assignments and calculate friend scores
     print_crew_assignments(solver, person_crew, youth_list, centers)
