@@ -1,19 +1,20 @@
-import polars as pl
 import argparse
+
+import polars as pl
 from ortools.sat.python import cp_model
-from src.analysis import calculate_friend_scores
+
+from src.analysis import calculate_friend_scores, print_crew_assignments, status_to_string
 from src.cleaning import (
-    get_centers_from_adults_df,
-    get_youth_from_buddy_form_df,
-    all_parents_are_valid,
     all_friends_are_valid,
+    all_parents_are_valid,
+    get_centers_from_adults_df,
     get_historical_youth_leaders,
+    get_youth_from_buddy_form_df,
 )
-from src.config import Config, CenterConfig
-from src.writer import write_results_to_csv
-from src.analysis import print_crew_assignments, status_to_string
-from src.linear_program.lp_model import create_crew_assignment_model
 from src.clustering import analyze_clusters
+from src.config import CenterConfig, Config
+from src.linear_program.lp_model import create_crew_assignment_model
+from src.writer import write_results_to_csv
 
 
 def main():
@@ -21,15 +22,9 @@ def main():
     parser = argparse.ArgumentParser(description='Run crew assignment optimization')
     parser.add_argument('-y', '--year', type=int, required=True, help='Year for the crew assignments')
     parser.add_argument(
-        '--centers',
-        nargs='*',
-        help='Center specifications in format "CenterName:CrewCount" or "CenterName" (e.g., Fayette:11 Kanawha:12)'
+        '--centers', nargs='*', help='Center specifications in format "CenterName:CrewCount" or "CenterName" (e.g., Fayette:11 Kanawha:12)'
     )
-    parser.add_argument(
-        '--analyze-clusters',
-        action='store_true',
-        help='Run friend cluster analysis and generate visualization'
-    )
+    parser.add_argument('--analyze-clusters', action='store_true', help='Run friend cluster analysis and generate visualization')
     args = parser.parse_args()
 
     year = args.year
@@ -72,37 +67,41 @@ def main():
     cfg = Config.default()
 
     # Create and solve model
-    model, person_center, person_crew, adult_crew = create_crew_assignment_model(
-        cfg, youth_list, centers, center_only_adults, unassigned_adults
-    )
+    model, person_crew, adult_crew = create_crew_assignment_model(cfg, youth_list, centers, center_only_adults, unassigned_adults)
 
     solver = cp_model.CpSolver()
-    # solver.parameters.max_time_in_seconds = 300.0
+    solver.parameters.max_time_in_seconds = 300.0
     solver.parameters.num_search_workers = 8
     solver.parameters.log_search_progress = True
+    solver.parameters.relative_gap_limit = 0.005  # Stop when within 0.5% of optimal
     status = solver.Solve(model)
 
     if status == cp_model.OPTIMAL or status == cp_model.FEASIBLE:
         print(f'Solution found! Status: {status_to_string(status)}')
-        print_crew_assignments(solver, person_crew, person_center, youth_list, centers)
+        print_crew_assignments(solver, person_crew, youth_list, centers)
         write_results_to_csv(
-            solver, person_crew, youth_list, centers, year=year, 
-            adult_crew=adult_crew, unassigned_adults=unassigned_adults, 
-            center_only_adults=center_only_adults
+            solver,
+            person_crew,
+            youth_list,
+            centers,
+            year=year,
+            adult_crew=adult_crew,
+            unassigned_adults=unassigned_adults,
+            center_only_adults=center_only_adults,
         )
-        
+
         # Run cluster analysis if requested
         if analyze_clusters_flag:
             # Filter to only regular youth (not young adults) for cluster analysis
             regular_youth = [y for y in youth_list if y.role == 'Youth']
-            analyze_clusters(regular_youth, solver, person_center, centers, output_dir='./data/results')
+            analyze_clusters(regular_youth, solver, person_crew, centers, year=year, output_dir='./data/results')
     else:
         print(f'No solution found. Status: {status_to_string(status)}')
         # Print some stats about the failed solve
         print('Statistics:')
         print(solver.ResponseStats())
 
-    center_scores, avg_score = calculate_friend_scores(solver, person_center, youth_list, centers)
+    center_scores, avg_score = calculate_friend_scores(solver, person_crew, youth_list, centers)
     print('=' * 50)
     print('Algorithm Friend Scores:')
     print(f'Center scores: {center_scores}')

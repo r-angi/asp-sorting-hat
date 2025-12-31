@@ -43,7 +43,7 @@ def test_data() -> dict[str, Any]:
     
     # Create and solve model
     cfg = Config.default()
-    model, person_center, person_crew, adult_crew = create_crew_assignment_model(
+    model, person_crew, adult_crew = create_crew_assignment_model(
         cfg, youth_list, centers, center_only_adults, unassigned_adults
     )
     
@@ -55,7 +55,6 @@ def test_data() -> dict[str, Any]:
     return {
         "status": status,
         "solver": solver,
-        "person_center": person_center,
         "person_crew": person_crew,
         "adult_crew": adult_crew,
         "youth_list": youth_list,

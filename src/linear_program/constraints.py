@@ -27,27 +27,9 @@ def add_one_crew_per_youth(model: cp_model.CpModel, person_crew: dict, youth_lis
                         model.Add(person_crew[youth.name, center.name, crew.name] == 0)
 
 
-def link_crew_and_center_vars(
-    model: cp_model.CpModel, person_crew: dict, person_center: dict, youth_list: list[Youth], centers: list[Center]
-):
-    """
-    Links the crew and center assignment variables.
-
-    If a youth is assigned to a crew in a center, they must be marked as assigned to that center.
-    This maintains consistency between crew and center assignments and simplifies other constraints.
-    """
-    for youth in youth_list:
-        for center in centers:
-            model.Add(
-                person_center[youth.name, center.name]
-                == sum(person_crew[youth.name, center.name, crew.name] for crew in center.crews)
-            )
-
-
 def enforce_parent_center_constraint(
     model: cp_model.CpModel,
     person_crew: dict,
-    person_center: dict,
     youth_list: list[Youth],
     centers: list[Center],
 ):
@@ -80,8 +62,12 @@ def enforce_parent_center_constraint(
             parent_center = adult_to_center.get(youth.parent_names_list[0])
 
             if parent_center:
-                # Youth must be assigned to the parent's center
-                model.Add(person_center[youth.name, parent_center.name] == 1)
+                # Youth must be assigned to the parent's center (computed from crew assignments)
+                youth_at_parent_center = sum(
+                    person_crew[youth.name, parent_center.name, crew.name] 
+                    for crew in parent_center.crews
+                )
+                model.Add(youth_at_parent_center == 1)
 
                 # Prevent youth from being in same crew as any parent
                 for crew in parent_center.crews:
@@ -91,7 +77,7 @@ def enforce_parent_center_constraint(
 
 
 def enforce_sibling_center_constraint(
-    model: cp_model.CpModel, person_center: dict, youth_list: list[Youth], centers: list[Center], youth_dict: dict
+    model: cp_model.CpModel, person_crew: dict, youth_list: list[Youth], centers: list[Center], youth_dict: dict
 ):
     """
     Ensures siblings are assigned to the same center.
@@ -103,7 +89,16 @@ def enforce_sibling_center_constraint(
         for sibling in youth.siblings_list:
             if sibling in youth_dict:
                 for center in centers:
-                    model.Add(person_center[youth.name, center.name] == person_center[sibling, center.name])
+                    # Sum of crew assignments equals 1 if person is at center, 0 otherwise
+                    youth_at_center = sum(
+                        person_crew[youth.name, center.name, crew.name] 
+                        for crew in center.crews
+                    )
+                    sibling_at_center = sum(
+                        person_crew[sibling, center.name, crew.name] 
+                        for crew in center.crews
+                    )
+                    model.Add(youth_at_center == sibling_at_center)
 
 
 def enforce_sibling_crew_separation_constraint(
@@ -169,7 +164,7 @@ def enforce_friend_separation_constraint(
 
 
 def enforce_friend_center_constraint(
-    model: cp_model.CpModel, person_center: dict, youth_list: list[Youth], centers: list[Center], youth_dict: dict
+    model: cp_model.CpModel, person_crew: dict, youth_list: list[Youth], centers: list[Center], youth_dict: dict
 ):
     """
     Ensures youth are assigned to centers with at least one of their friend choices.
@@ -183,8 +178,18 @@ def enforce_friend_center_constraint(
         valid_choices = [c for c in choices if c is not None and c in youth_dict]
         if valid_choices:
             for center in centers:
-                friend_vars = [person_center[friend, center.name] for friend in valid_choices]
-                model.Add(person_center[youth.name, center.name] <= sum(friend_vars))
+                # Youth at center (computed from crew assignments)
+                youth_at_center = sum(
+                    person_crew[youth.name, center.name, crew.name]
+                    for crew in center.crews
+                )
+                # Friends at center (computed from crew assignments)
+                friends_at_center = sum(
+                    person_crew[friend, center.name, crew.name]
+                    for friend in valid_choices
+                    for crew in center.crews
+                )
+                model.Add(youth_at_center <= friends_at_center)
 
 
 def enforce_crew_size_constraints(
@@ -239,7 +244,7 @@ def enforce_past_leader_constraint(
 
 def enforce_supervision_group_limit(
     model: cp_model.CpModel,
-    person_center: dict,
+    person_crew: dict,
     youth_list: list[Youth],
     centers: list[Center],
     max_per_center: int = 2,
@@ -259,15 +264,18 @@ def enforce_supervision_group_limit(
     # Add constraint for each group/center combination
     for group_name, group_youth in groups.items():
         for center in centers:
-            model.Add(
-                sum(person_center[y.name, center.name] for y in group_youth)
-                <= max_per_center
+            # Count group members at this center (computed from crew assignments)
+            group_at_center = sum(
+                person_crew[y.name, center.name, crew.name]
+                for y in group_youth
+                for crew in center.crews
             )
+            model.Add(group_at_center <= max_per_center)
 
 
 def enforce_anti_buddy_constraint(
     model: cp_model.CpModel,
-    person_center: dict,
+    person_crew: dict,
     youth_list: list[Youth],
     centers: list[Center],
     youth_dict: dict[str, Youth],
@@ -282,10 +290,16 @@ def enforce_anti_buddy_constraint(
                 if pair not in processed_pairs:
                     processed_pairs.add(pair)
                     for center in centers:
-                        model.Add(
-                            person_center[youth.name, center.name]
-                            + person_center[anti_buddy, center.name] <= 1
+                        # Youth at center (computed from crew assignments)
+                        youth_at_center = sum(
+                            person_crew[youth.name, center.name, crew.name]
+                            for crew in center.crews
                         )
+                        anti_buddy_at_center = sum(
+                            person_crew[anti_buddy, center.name, crew.name]
+                            for crew in center.crews
+                        )
+                        model.Add(youth_at_center + anti_buddy_at_center <= 1)
 
 
 def assign_center_only_adults(

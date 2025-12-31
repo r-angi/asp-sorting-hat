@@ -5,7 +5,7 @@ from src.config import Config
 
 def add_friend_preference_objectives(
     model: cp_model.CpModel,
-    person_center: dict,
+    person_crew: dict,
     youth_list: list[Youth],
     centers: list[Center],
     cfg: Config,
@@ -38,17 +38,29 @@ def add_friend_preference_objectives(
                         # Only add objective term if young adult is actually in this center
                         is_ya_in_center = any(youth.name in crew.adults for crew in center.crews)
                         if is_ya_in_center:
-                            objective_terms.append(cfg.friend_weight * weight * person_center[friend, center.name])
+                            # Friend at center (computed from crew assignments)
+                            friend_at_center = sum(
+                                person_crew[friend, center.name, crew.name]
+                                for crew in center.crews
+                            )
+                            objective_terms.append(cfg.friend_weight * weight * friend_at_center)
                     else:
-                        # Simplified: reward when both youth and friend are in the same center
-                        # This is equivalent to the multiplication but more efficient
-                        same_center = model.NewBoolVar(f'same_center_{youth.name}_{friend}_{center.name}')
-                        model.Add(same_center <= person_center[youth.name, center.name])
-                        model.Add(same_center <= person_center[friend, center.name])
-                        model.Add(
-                            same_center
-                            >= person_center[youth.name, center.name] + person_center[friend, center.name] - 1
+                        # Reward when both youth and friend are in the same center
+                        # Compute center assignment from crew assignments
+                        youth_at_center = sum(
+                            person_crew[youth.name, center.name, crew.name]
+                            for crew in center.crews
                         )
+                        friend_at_center = sum(
+                            person_crew[friend, center.name, crew.name]
+                            for crew in center.crews
+                        )
+                        
+                        # Create boolean for both being at same center (logical AND)
+                        same_center = model.NewBoolVar(f'same_center_{youth.name}_{friend}_{center.name}')
+                        model.Add(same_center <= youth_at_center)
+                        model.Add(same_center <= friend_at_center)
+                        model.Add(same_center >= youth_at_center + friend_at_center - 1)
                         objective_terms.append(cfg.friend_weight * weight * same_center)
 
     return objective_terms
@@ -99,20 +111,35 @@ def add_year_diversity_objectives(
 
     Adds a point for each year (Fr/So/Jr/Sr) that is represented in the crew,
     encouraging a mix of ages rather than grouping by grade level.
+    
+    Optimized: Creates one IntVar per crew that counts total years present,
+    rather than 4 separate objective terms per crew.
     """
     objective_terms = []
     years = ['Fr', 'So', 'Jr', 'Sr']
 
     for center in centers:
         for crew in center.crews:
+            # Track which years are present with booleans
+            year_booleans = []
+            
             for year in years:
                 year_count = sum(
-                    person_crew[youth.name, center.name, crew.name] for youth in youth_list if youth.year == year
+                    person_crew[youth.name, center.name, crew.name] 
+                    for youth in youth_list if youth.year == year
                 )
-                has_year = model.NewBoolVar(f'has_year_{center.name}_{crew.name}_{year}')
+                # Boolean: is this year present in the crew?
+                has_year = model.NewBoolVar(f'has_{year}_{center.name}_{crew.name}')
                 model.Add(year_count >= 1).OnlyEnforceIf(has_year)
                 model.Add(year_count == 0).OnlyEnforceIf(has_year.Not())
-                objective_terms.append(cfg.year_weight * has_year)
+                year_booleans.append(has_year)
+            
+            # Create single IntVar that counts how many different years are present (0-4)
+            years_present = model.NewIntVar(0, 4, f'years_present_{center.name}_{crew.name}')
+            model.Add(years_present == sum(year_booleans))
+            
+            # Add single objective term per crew (instead of 4)
+            objective_terms.append(cfg.year_weight * years_present)
 
     return objective_terms
 
