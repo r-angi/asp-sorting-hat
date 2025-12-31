@@ -14,7 +14,113 @@ from src.cleaning import (
 from src.clustering import analyze_clusters
 from src.config import CenterConfig, Config
 from src.linear_program.lp_model import create_crew_assignment_model
+from src.models import Center, Youth
 from src.writer import write_results_to_csv
+
+
+class MockSolver:
+    """Mock solver that returns values from a dict, compatible with cp_model.CpSolver interface."""
+
+    def __init__(self, person_crew: dict[tuple[str, str, str], int]):
+        self.person_crew = person_crew
+
+    def Value(self, var: tuple[str, str, str]) -> int:
+        """Return value from the person_crew dict."""
+        return self.person_crew.get(var, 0)
+
+
+def load_existing_assignments(year: int, youth_list: list[Youth], centers: list[Center]) -> dict[tuple[str, str, str], int]:
+    """Load existing assignments from CSV and create lookup dict compatible with solver interface."""
+    assignments_df = pl.read_csv(f'./data/results/assignments_{year}_final.csv')
+
+    # Create a lookup dict: (person_name, center_name, crew_name) -> 1 or 0
+    person_crew = {}
+
+    for center in centers:
+        for crew in center.crews:
+            for youth in youth_list:
+                # Check if this person is assigned to this center/crew
+                match = assignments_df.filter((pl.col('Name') == youth.name) & (pl.col('Center') == center.name) & (pl.col('Crew') == crew.name))
+                person_crew[youth.name, center.name, crew.name] = 1 if len(match) > 0 else 0
+
+    return person_crew
+
+
+def analyze_existing_assignments(year: int, youth_list: list[Youth], centers: list[Center]) -> None:
+    """Analyze existing assignments without re-running optimization."""
+    print('\n' + '=' * 50)
+    print('ANALYZING EXISTING ASSIGNMENTS (--no-reassignment)')
+    print('=' * 50)
+
+    # Load existing assignments from CSV
+    person_crew = load_existing_assignments(year, youth_list, centers)
+    solver = MockSolver(person_crew)
+
+    # Print assignments and calculate friend scores
+    print_crew_assignments(solver, person_crew, youth_list, centers)
+
+    # Always run cluster analysis when analyzing existing assignments
+    regular_youth = [y for y in youth_list if y.role == 'Youth']
+    analyze_clusters(regular_youth, solver, person_crew, centers, year=year, output_dir='./data/results')
+
+    # Calculate and display friend scores
+    center_scores, avg_score = calculate_friend_scores(solver, person_crew, youth_list, centers)
+    print('=' * 50)
+    print('Algorithm Friend Scores:')
+    print(f'Center scores: {center_scores}')
+    print(f'Average score: {avg_score}')
+
+
+def run_optimization(
+    year: int,
+    youth_list: list[Youth],
+    centers: list[Center],
+    center_only_adults: list,
+    unassigned_adults: list,
+    analyze_clusters_flag: bool,
+) -> None:
+    """Run the optimization and optionally analyze clusters."""
+    cfg = Config.default()
+
+    # Create and solve model
+    model, person_crew, adult_crew = create_crew_assignment_model(cfg, youth_list, centers, center_only_adults, unassigned_adults)
+
+    solver = cp_model.CpSolver()
+    solver.parameters.max_time_in_seconds = 300.0
+    solver.parameters.num_search_workers = 8
+    solver.parameters.log_search_progress = True
+    solver.parameters.relative_gap_limit = 0.005  # Stop within 0.5% of optimal
+    status = solver.Solve(model)
+
+    if status == cp_model.OPTIMAL or status == cp_model.FEASIBLE:
+        print(f'Solution found! Status: {status_to_string(status)}')
+        print_crew_assignments(solver, person_crew, youth_list, centers)
+        write_results_to_csv(
+            solver,
+            person_crew,
+            youth_list,
+            centers,
+            year=year,
+            adult_crew=adult_crew,
+            unassigned_adults=unassigned_adults,
+            center_only_adults=center_only_adults,
+        )
+
+        # Run cluster analysis if requested
+        if analyze_clusters_flag:
+            regular_youth = [y for y in youth_list if y.role == 'Youth']
+            analyze_clusters(regular_youth, solver, person_crew, centers, year=year, output_dir='./data/results')
+    else:
+        print(f'No solution found. Status: {status_to_string(status)}')
+        print('Statistics:')
+        print(solver.ResponseStats())
+
+    # Calculate and display friend scores
+    center_scores, avg_score = calculate_friend_scores(solver, person_crew, youth_list, centers)
+    print('=' * 50)
+    print('Algorithm Friend Scores:')
+    print(f'Center scores: {center_scores}')
+    print(f'Average score: {avg_score}')
 
 
 def main():
@@ -25,11 +131,13 @@ def main():
         '--centers', nargs='*', help='Center specifications in format "CenterName:CrewCount" or "CenterName" (e.g., Fayette:11 Kanawha:12)'
     )
     parser.add_argument('--analyze-clusters', action='store_true', help='Run friend cluster analysis and generate visualization')
+    parser.add_argument('--no-reassignment', action='store_true', help='Skip optimization and analyze existing assignments from CSV')
     args = parser.parse_args()
 
     year = args.year
     center_specs = args.centers
     analyze_clusters_flag = args.analyze_clusters
+    no_reassignment = args.no_reassignment
 
     # Parse center configurations
     center_configs = None
@@ -64,48 +172,11 @@ def main():
     if unassigned_adults:
         print(f'Unassigned adults (algorithm assigns center & crew): {len(unassigned_adults)}')
 
-    cfg = Config.default()
-
-    # Create and solve model
-    model, person_crew, adult_crew = create_crew_assignment_model(cfg, youth_list, centers, center_only_adults, unassigned_adults)
-
-    solver = cp_model.CpSolver()
-    solver.parameters.max_time_in_seconds = 300.0
-    solver.parameters.num_search_workers = 8
-    solver.parameters.log_search_progress = True
-    solver.parameters.relative_gap_limit = 0.005  # Stop when within 0.5% of optimal
-    status = solver.Solve(model)
-
-    if status == cp_model.OPTIMAL or status == cp_model.FEASIBLE:
-        print(f'Solution found! Status: {status_to_string(status)}')
-        print_crew_assignments(solver, person_crew, youth_list, centers)
-        write_results_to_csv(
-            solver,
-            person_crew,
-            youth_list,
-            centers,
-            year=year,
-            adult_crew=adult_crew,
-            unassigned_adults=unassigned_adults,
-            center_only_adults=center_only_adults,
-        )
-
-        # Run cluster analysis if requested
-        if analyze_clusters_flag:
-            # Filter to only regular youth (not young adults) for cluster analysis
-            regular_youth = [y for y in youth_list if y.role == 'Youth']
-            analyze_clusters(regular_youth, solver, person_crew, centers, year=year, output_dir='./data/results')
+    # Route to appropriate workflow
+    if no_reassignment:
+        analyze_existing_assignments(year, youth_list, centers)
     else:
-        print(f'No solution found. Status: {status_to_string(status)}')
-        # Print some stats about the failed solve
-        print('Statistics:')
-        print(solver.ResponseStats())
-
-    center_scores, avg_score = calculate_friend_scores(solver, person_crew, youth_list, centers)
-    print('=' * 50)
-    print('Algorithm Friend Scores:')
-    print(f'Center scores: {center_scores}')
-    print(f'Average score: {avg_score}')
+        run_optimization(year, youth_list, centers, center_only_adults, unassigned_adults, analyze_clusters_flag)
 
 
 if __name__ == '__main__':
