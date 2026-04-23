@@ -3,9 +3,22 @@ from src.models import Center, Youth
 import polars as pl
 
 
+def is_person_at_center(
+    solver: cp_model.CpSolver,
+    person_crew: dict,
+    person_name: str,
+    center: Center,
+) -> bool:
+    """Helper function to check if a person is at a center based on crew assignments."""
+    for crew in center.crews:
+        if solver.Value(person_crew[person_name, center.name, crew.name]) == 1:
+            return True
+    return False
+
+
 def calculate_friend_scores(
     solver: cp_model.CpSolver,
-    person_center: dict[tuple[str, str], int],
+    person_crew: dict,
     youth_list: list[Youth],
     centers: list[Center],
 ) -> tuple[dict[str, float], float]:
@@ -15,7 +28,7 @@ def calculate_friend_scores(
     # Calculate raw scores and count people in each center
     for youth in youth_list:
         for center in centers:
-            if solver.Value(person_center[youth.name, center.name]) == 1:
+            if is_person_at_center(solver, person_crew, youth.name, center):
                 center_people_count[center.name] += 1
 
                 # Calculate friendship scores
@@ -26,7 +39,7 @@ def calculate_friend_scores(
                 }
                 for friend_name, weight in friend_weights.items():
                     if friend_name and friend_name in youth_dict:
-                        if solver.Value(person_center[friend_name, center.name]) == 1:
+                        if is_person_at_center(solver, person_crew, friend_name, center):
                             center_scores[center.name] += weight
     # Normalize scores by number of people
     normalized_scores = {
@@ -82,7 +95,7 @@ def calculate_historical_friend_scores(centers: list[Center], year: int) -> tupl
     return normalized_scores, avg_score
 
 
-def calculate_friend_choice_stats(solver, person_center, youth_list, centers):
+def calculate_friend_choice_stats(solver, person_crew, youth_list, centers):
     """Calculate statistics about friend choice fulfillment."""
     youth_dict = {youth.name: youth for youth in youth_list}
     stats = {
@@ -106,8 +119,8 @@ def calculate_friend_choice_stats(solver, person_center, youth_list, centers):
                 # Check if they're in the same center
                 for center in centers:
                     if (
-                        solver.Value(person_center[youth.name, center.name]) == 1
-                        and solver.Value(person_center[friend_name, center.name]) == 1
+                        is_person_at_center(solver, person_crew, youth.name, center)
+                        and is_person_at_center(solver, person_crew, friend_name, center)
                     ):
                         stats[choice_type] += 1
                         friends_with += 1
@@ -126,9 +139,9 @@ def calculate_friend_choice_stats(solver, person_center, youth_list, centers):
     }
 
 
-def print_crew_assignments(solver, person_crew, person_center, youth_list, centers):
+def print_crew_assignments(solver, person_crew, youth_list, centers):
     youth_dict = {youth.name: youth for youth in youth_list}
-    friend_scores, _ = calculate_friend_scores(solver, person_center, youth_list, centers)
+    friend_scores, _ = calculate_friend_scores(solver, person_crew, youth_list, centers)
 
     # Track center-level statistics
     center_stats = {}
@@ -191,7 +204,7 @@ def print_crew_assignments(solver, person_crew, person_center, youth_list, cente
     print(f'Total Participants: {total_youth + total_adults}')
 
     # Add friend choice statistics
-    friend_stats = calculate_friend_choice_stats(solver, person_center, youth_list, centers)
+    friend_stats = calculate_friend_choice_stats(solver, person_crew, youth_list, centers)
     print('\nFriend Choice Statistics:')
     print(f'Youth with first choice friend: {friend_stats["first_choice_pct"]}%')
     print(f'Youth with second choice friend: {friend_stats["second_choice_pct"]}%')

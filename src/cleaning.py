@@ -1,6 +1,7 @@
 import polars as pl
 import os
 from src.models import Center, Crew, Youth
+from src.config import CenterConfig
 
 
 def get_full_name_lookup(df: pl.DataFrame) -> dict[str, str]:
@@ -183,18 +184,137 @@ def get_historical_youth_leaders(all_historical_crews: pl.DataFrame) -> dict[str
     return {row['youth_name']: row['adult_names'] for row in youth_pairings_df.iter_rows(named=True)}
 
 
-def get_centers_from_adults_df(adult_crews: pl.DataFrame) -> list[Center]:
+def _build_centers_from_df(adult_crews: pl.DataFrame) -> list[Center]:
+    """Build centers from df without any configuration."""
     centers: list[Center] = []
-    center_df = adult_crews.group_by('Center').agg(pl.col('Crew'))
+    # Filter to only rows with non-null Crew assignments
+    crew_assigned = adult_crews.filter(pl.col('Crew').is_not_null() & (pl.col('Crew') != ''))
+    center_df = crew_assigned.group_by('Center').agg(pl.col('Crew'))
     for center_row in center_df.iter_rows(named=True):
         this_center = center_row['Center']
         crews: list[Crew] = []
-        crew_df = adult_crews.filter(pl.col('Center') == this_center).group_by('Crew').agg(pl.col('name'))
+        crew_df = crew_assigned.filter(pl.col('Center') == this_center).group_by('Crew').agg(pl.col('name'))
         for crew_row in crew_df.iter_rows(named=True):
             crew = Crew(name=crew_row['Crew'], adults=crew_row['name'])
             crews.append(crew)
         centers.append(Center(name=this_center, crews=crews))
     return centers
+
+
+def _build_crews_from_df(adult_crews: pl.DataFrame, center_name: str) -> list[Crew]:
+    """Build crews for a center by extracting from df."""
+    crew_assigned = adult_crews.filter(
+        (pl.col('Center') == center_name) & 
+        pl.col('Crew').is_not_null() & 
+        (pl.col('Crew') != '')
+    )
+    crews: list[Crew] = []
+    if len(crew_assigned) > 0:
+        crew_df = crew_assigned.group_by('Crew').agg(pl.col('name'))
+        for crew_row in crew_df.iter_rows(named=True):
+            crew = Crew(name=crew_row['Crew'], adults=crew_row['name'])
+            crews.append(crew)
+    return crews
+
+
+def _build_crews_for_center(
+    adult_crews: pl.DataFrame,
+    center_name: str,
+    crew_count: int,
+) -> list[Crew]:
+    """Build crews for a center with specified count.
+    
+    Creates crew_count crews (named C01, C02, etc. using center prefix).
+    Populates adults from df where available.
+    """
+    prefix = center_name[0].upper()  # F for Fayette, K for Kanawha, etc.
+    crews: list[Crew] = []
+    
+    for i in range(1, crew_count + 1):
+        crew_name = f"{prefix}{i:02d}"
+        # Get adults assigned to this crew from df (if any)
+        crew_adults_df = adult_crews.filter(
+            (pl.col('Center') == center_name) & 
+            (pl.col('Crew') == crew_name)
+        )
+        crew_adults = crew_adults_df['name'].to_list() if len(crew_adults_df) > 0 else []
+        crews.append(Crew(name=crew_name, adults=crew_adults))
+    
+    return crews
+
+
+def get_centers_from_adults_df(
+    adult_crews: pl.DataFrame,
+    center_configs: list[CenterConfig] | None = None,
+) -> tuple[list[Center], list[tuple[str, str]], list[str]]:
+    """Extract centers from adults df with optional configuration.
+    
+    Args:
+        adult_crews: DataFrame with adult crew assignments
+        center_configs: Optional list of center configurations.
+            - If None: extract all centers and crews from df
+            - If provided: validate df centers are subset, use specified crew counts
+              where provided, otherwise extract from df
+    
+    Returns:
+        Tuple of (
+            list of Center objects,
+            list of center-only adults as (name, center),
+            list of unassigned adults (no center or crew)
+        )
+    
+    Raises:
+        ValueError: If df contains centers not in center_configs
+    """
+    # Get center-only adults (those with Center but blank Crew column)
+    center_only_adults = adult_crews.filter(
+        (pl.col('Center').is_not_null() & (pl.col('Center') != '')) &
+        (pl.col('Crew').is_null() | (pl.col('Crew') == ''))
+    )
+    center_only_list = [
+        (row['name'], row['Center']) 
+        for row in center_only_adults.iter_rows(named=True)
+    ]
+    
+    # Get unassigned adults (those with no Center and no Crew)
+    unassigned_adults = adult_crews.filter(
+        (pl.col('Center').is_null() | (pl.col('Center') == '')) &
+        (pl.col('Crew').is_null() | (pl.col('Crew') == ''))
+    )
+    unassigned_list = [
+        row['name'] 
+        for row in unassigned_adults.iter_rows(named=True)
+    ]
+    
+    # Get unique centers from df (excluding null/empty)
+    df_centers = set(
+        c for c in adult_crews['Center'].unique().to_list() 
+        if c is not None and c != ''
+    )
+    
+    if center_configs is None:
+        # Default behavior: extract everything from CSV
+        return _build_centers_from_df(adult_crews), center_only_list, unassigned_list
+    
+    # Validate df centers are subset of configured centers
+    config_names = {c.name for c in center_configs}
+    invalid = df_centers - config_names
+    if invalid:
+        raise ValueError(
+            f"Centers {invalid} in adults df not in configured list: {config_names}"
+        )
+    
+    centers: list[Center] = []
+    for cfg in center_configs:
+        if cfg.crew_count is not None:
+            # Use specified crew count, create empty crews if needed
+            crews = _build_crews_for_center(adult_crews, cfg.name, cfg.crew_count)
+        else:
+            # Extract crew count from df
+            crews = _build_crews_from_df(adult_crews, cfg.name)
+        centers.append(Center(name=cfg.name, crews=crews))
+    
+    return centers, center_only_list, unassigned_list
 
 
 def get_youth_from_buddy_form_df(youth: pl.DataFrame) -> list[Youth]:

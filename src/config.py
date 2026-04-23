@@ -2,12 +2,29 @@ from dataclasses import dataclass
 
 
 @dataclass
+class CenterConfig:
+    """Configuration for a center's crew setup."""
+    name: str
+    crew_count: int | None = None  # None = extract from CSV
+
+    @classmethod
+    def parse(cls, spec: str) -> 'CenterConfig':
+        """Parse 'CenterName' or 'CenterName:count' format."""
+        if ':' in spec:
+            name, count = spec.split(':', 1)
+            return cls(name=name, crew_count=int(count))
+        return cls(name=spec)
+
+
+@dataclass
 class Config:
     """Configuration for crew assignment model."""
 
     # Crew size constraints
     min_crew_size: int = 5
     max_crew_size: int = 7
+    min_adults_per_crew: int = 2
+    max_adults_per_crew: int = 3
 
     # Objective weights
     friend_weight: int = 2  # Weight for friend preferences

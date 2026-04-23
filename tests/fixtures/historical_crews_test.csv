@@ -1,0 +1,14 @@
+name,crew_year,is_adult
+Alice Johnson,F01 2024,False
+John Baker,F01 2024,True
+Linda O'Brien,F01 2024,True
+Bob Smith,K02 2023,False
+Frank Green,K02 2023,True
+George Hill,K02 2023,True
+David Lee,N01 2023,False
+Janet Moore,N01 2023,True
+Kevin Scott,N01 2023,True
+Grace Taylor,F03 2024,False
+Sarah Garcia,F03 2024,True
+Tom Wilson,F03 2024,True
+
