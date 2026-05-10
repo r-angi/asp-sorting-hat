@@ -1,96 +1,76 @@
-import polars as pl
+"""Write the solver's assignment output to ``data/results/assignments_<year>.csv``."""
+
 import os
+from collections.abc import Sequence
+from itertools import chain
+
+import polars as pl
 from ortools.sat.python import cp_model
-from src.models import Youth, Center
+
+from src.models import Center, Leader, Youth
+
+
+def _row(*, center_name: str, crew_name: str, name: str, role: str,
+         gender: str | None, year: str, history: str | None) -> dict[str, str]:
+    return {
+        'Center': center_name,
+        'Crew': crew_name,
+        'Name': name,
+        'Role': role,
+        'Gender': gender or '',
+        'Year': year,
+        'History': history or '',
+    }
 
 
 def write_results_to_csv(
     solver: cp_model.CpSolver,
-    person_crew: dict[tuple[str, str, str], int],
+    person_crew: dict[tuple[str, str, str], cp_model.IntVar],
     youth_list: list[Youth],
     centers: list[Center],
     year: int,
-    adult_crew: dict[tuple[str, str, str], int] | None = None,
-    unassigned_adults: list[str] | None = None,
-    center_only_adults: list[tuple[str, str]] | None = None,
+    adult_crew: dict[tuple[str, str, str], cp_model.IntVar] | None = None,
+    unassigned_adults: Sequence[Leader] | None = None,
+    center_only_adults: Sequence[Leader] | None = None,
 ) -> None:
-    """Write all assignments and participant info to a CSV file."""
+    """Emit one row per (youth or leader, crew) placement.
+
+    Pre-assigned leaders come from ``crew.adults`` (typed instances). Flexible
+    leaders (Adult / Young Adult, center-only + unassigned) come from the matching
+    ``adult_crew`` Boolean — collapsed into one loop using ``itertools.chain``.
+    """
     output_path = f'./data/results/assignments_{year}.csv'
-    # Create results directory if it doesn't exist
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
-    rows = []
+    flex_pool: list[Leader] = list(chain(center_only_adults or [], unassigned_adults or []))
+    rows: list[dict[str, str]] = []
 
-    # Add youth with their assignments and attributes
     for center in centers:
         for crew in center.crews:
-            # Add youth in this crew
-            crew_youth = [
-                youth for youth in youth_list if solver.Value(person_crew[youth.name, center.name, crew.name]) == 1
-            ]
-            for youth in crew_youth:
-                rows.append(
-                    {
-                        'Center': center.name,
-                        'Crew': crew.name,
-                        'Name': youth.name,
-                        'Role': 'Youth',
-                        'Gender': youth.gender,
-                        'Year': youth.year,
-                        'History': youth.history,
-                    }
-                )
+            for youth in youth_list:
+                key = (youth.name, center.name, crew.name)
+                if key not in person_crew or solver.Value(person_crew[key]) != 1:
+                    continue
+                rows.append(_row(
+                    center_name=center.name, crew_name=crew.name, name=youth.name,
+                    role='Youth', gender=youth.gender, year=youth.year, history=youth.history,
+                ))
 
-            # Add pre-assigned adults in this crew
-            for adult in crew.adults:
-                rows.append(
-                    {
-                        'Center': center.name,
-                        'Crew': crew.name,
-                        'Name': adult,
-                        'Role': 'Adult',
-                        'Gender': '',
-                        'Year': '',
-                        'History': '',
-                    }
-                )
-            
-            # Add center-only adults assigned to this crew
-            if adult_crew and center_only_adults:
-                for adult_name, assigned_center in center_only_adults:
-                    if assigned_center == center.name:
-                        if (adult_name, center.name, crew.name) in adult_crew:
-                            if solver.Value(adult_crew[adult_name, center.name, crew.name]) == 1:
-                                rows.append(
-                                    {
-                                        'Center': center.name,
-                                        'Crew': crew.name,
-                                        'Name': adult_name,
-                                        'Role': 'Adult',
-                                        'Gender': '',
-                                        'Year': '',
-                                        'History': '',
-                                    }
-                                )
-            
-            # Add unassigned adults assigned to this crew
-            if adult_crew and unassigned_adults:
-                for adult_name in unassigned_adults:
-                    if (adult_name, center.name, crew.name) in adult_crew:
-                        if solver.Value(adult_crew[adult_name, center.name, crew.name]) == 1:
-                            rows.append(
-                                {
-                                    'Center': center.name,
-                                    'Crew': crew.name,
-                                    'Name': adult_name,
-                                    'Role': 'Adult',
-                                    'Gender': '',
-                                    'Year': '',
-                                    'History': '',
-                                }
-                            )
+            for leader in crew.adults:
+                rows.append(_row(
+                    center_name=center.name, crew_name=crew.name, name=leader.name,
+                    role=leader.role, gender=leader.gender, year='', history=leader.history,
+                ))
 
-    # Convert to DataFrame and write to CSV
-    results_df = pl.DataFrame(rows)
-    results_df.write_csv(output_path)
+            if adult_crew is not None:
+                for leader in flex_pool:
+                    key = (leader.name, center.name, crew.name)
+                    if key not in adult_crew or solver.Value(adult_crew[key]) != 1:
+                        continue
+                    rows.append(_row(
+                        center_name=center.name, crew_name=crew.name, name=leader.name,
+                        role=leader.role, gender=leader.gender, year='', history=leader.history,
+                    ))
+
+    pl.DataFrame(rows).write_csv(output_path)
     print(f'\nResults written to {output_path}')

@@ -1,177 +1,253 @@
+"""Objective-term builders for the crew-assignment model.
+
+Soft preferences only — hard rules live in ``constraints.py``. Every helper
+takes a single ``ModelContext`` and returns a list of weighted ``LinearExpr``
+terms that ``lp_model`` sums into the ``Maximize`` objective.
+
+Like the constraint helpers, these reuse the cached ``at_center`` map and the
+sparse ``person_crew`` dict on ``ctx``. ``person_crew.get(key, 0)`` is the
+safe lookup.
+"""
+
+from typing import Final, cast
+
 from ortools.sat.python import cp_model
-from src.models import Youth, Center
-from src.config import Config
+
+from src.linear_program.adult_placement import adult_presence_at_center
+from src.linear_program.context import ModelContext, PersonCrewVars
+from src.linear_program.leader_aggregates import crew_attribute_total
+from src.models import Youth
+
+ObjectiveTerm = cp_model.LinearExpr | int
+
+YEARS: Final[tuple[str, ...]] = ('Fr', 'So', 'Jr', 'Sr')
 
 
-def add_friend_preference_objectives(
+def _is_zero(value: cp_model.LinearExpr | int) -> bool:
+    return isinstance(value, int) and value == 0
+
+
+def _is_one(value: cp_model.LinearExpr | int) -> bool:
+    return isinstance(value, int) and value == 1
+
+
+def _same_center_term(
     model: cp_model.CpModel,
-    person_crew: dict,
-    youth_list: list[Youth],
-    centers: list[Center],
-    cfg: Config,
-    youth_dict: dict,
-) -> list:
-    """
-    Rewards youth being in the same center as their friend choices.
-    Young adults' friend preferences are considered but their assignments are fixed.
+    youth_at_center: cp_model.LinearExpr | int,
+    friend_at_center: cp_model.LinearExpr | int,
+    weight: int,
+    label: str,
+) -> ObjectiveTerm | None:
+    """Return ``weight * AND(youth_at_center, friend_at_center)`` as an objective term.
 
-    Weights are:
-    - First choice: 3 points
-    - Second choice: 2 points
-    - Third choice: 1 point
-
-    Each point is multiplied by the friend_weight from config.
+    Short-circuits when either side is the constant 0 or 1 to avoid building
+    redundant Booleans for forced placements (e.g. Young Adult fixed crews).
     """
-    objective_terms = []
-    for youth in youth_list:
-        # Include friend preferences for both youth and young adults
-        friend_choices = {
-            youth.first_choice: 3,
-            youth.second_choice: 2,
-            youth.third_choice: 1,
-        }
-        for friend, weight in friend_choices.items():
-            if friend is not None and friend in youth_dict:
-                for center in centers:
-                    # For young adults, their center assignment is fixed but still contributes to objective
-                    if youth.role == 'Young Adult':
-                        # Only add objective term if young adult is actually in this center
-                        is_ya_in_center = any(youth.name in crew.adults for crew in center.crews)
-                        if is_ya_in_center:
-                            # Friend at center (computed from crew assignments)
-                            friend_at_center = sum(
-                                person_crew[friend, center.name, crew.name]
-                                for crew in center.crews
-                            )
-                            objective_terms.append(cfg.friend_weight * weight * friend_at_center)
-                    else:
-                        # Reward when both youth and friend are in the same center
-                        # Compute center assignment from crew assignments
-                        youth_at_center = sum(
-                            person_crew[youth.name, center.name, crew.name]
-                            for crew in center.crews
-                        )
-                        friend_at_center = sum(
-                            person_crew[friend, center.name, crew.name]
-                            for crew in center.crews
-                        )
-                        
-                        # Create boolean for both being at same center (logical AND)
-                        same_center = model.NewBoolVar(f'same_center_{youth.name}_{friend}_{center.name}')
-                        model.Add(same_center <= youth_at_center)
-                        model.Add(same_center <= friend_at_center)
-                        model.Add(same_center >= youth_at_center + friend_at_center - 1)
-                        objective_terms.append(cfg.friend_weight * weight * same_center)
+    if _is_zero(youth_at_center) or _is_zero(friend_at_center):
+        return None
+    if _is_one(youth_at_center):
+        return cast(ObjectiveTerm, weight * friend_at_center)
+    if _is_one(friend_at_center):
+        return cast(ObjectiveTerm, weight * youth_at_center)
+
+    same_center = model.NewBoolVar(label)
+    model.Add(same_center <= youth_at_center)
+    model.Add(same_center <= friend_at_center)
+    model.Add(same_center >= youth_at_center + friend_at_center - 1)
+    return cast(ObjectiveTerm, weight * same_center)
+
+
+def add_friend_preference_objectives(ctx: ModelContext) -> list[ObjectiveTerm]:
+    """Reward each youth landing at a center where their picked friend is also placed.
+
+    Friend choices may name another youth (buddy roster) or an Adult / Young Adult.
+    Youth-youth same-center bonuses use ``cfg.friend_weight``; youth-adult bonuses
+    use ``cfg.adult_friend_weight`` (must be set).
+
+    Weights:
+        First choice: 3, Second: 2, Third: 1.
+    """
+    cfg = ctx.cfg
+    adult_w = cfg.adult_friend_weight
+    assert adult_w is not None
+
+    objective_terms: list[ObjectiveTerm] = []
+    weights = (3, 2, 1)
+
+    for youth in ctx.youth_list:
+        choices = (youth.first_choice, youth.second_choice, youth.third_choice)
+        for friend, weight in zip(choices, weights):
+            if friend is None:
+                continue
+
+            if friend in ctx.youth_dict:
+                youth_w = cfg.friend_weight * weight
+                for center in ctx.centers:
+                    term = _same_center_term(
+                        ctx.model,
+                        ctx.at_center[(youth.name, center.name)],
+                        ctx.at_center[(friend, center.name)],
+                        youth_w,
+                        f'same_center_{youth.name}_{friend}_{center.name}',
+                    )
+                    if term is not None:
+                        objective_terms.append(term)
+            elif friend in ctx.leaders_by_name:
+                leader = ctx.leaders_by_name[friend]
+                w = adult_w * weight
+                for center in ctx.centers:
+                    presence = adult_presence_at_center(leader, center, ctx.adult_crew)
+                    if presence is None:
+                        continue
+                    term = _same_center_term(
+                        ctx.model,
+                        ctx.at_center[(youth.name, center.name)],
+                        presence,
+                        w,
+                        f'same_center_adult_{youth.name}_{friend}_{center.name}',
+                    )
+                    if term is not None:
+                        objective_terms.append(term)
 
     return objective_terms
 
 
-def add_gender_diversity_objectives(
-    model: cp_model.CpModel,
-    person_crew: dict,
+def _crew_attribute_sum(
+    person_crew: PersonCrewVars,
     youth_list: list[Youth],
-    centers: list[Center],
-    cfg: Config,
-) -> list:
-    """
-    Rewards crews that have a good balance of male and female youth.
+    center_name: str,
+    crew_name: str,
+    attribute: str,
+    value: str,
+) -> cp_model.LinearExpr | int:
+    """Sum of ``person_crew`` Booleans for youth with ``attribute == value`` on a crew."""
+    terms = [
+        person_crew[(y.name, center_name, crew_name)]
+        for y in youth_list
+        if getattr(y, attribute) == value
+        and (y.name, center_name, crew_name) in person_crew
+    ]
+    if not terms:
+        return 0
+    return sum(terms)
 
-    Creates a gender_balance variable for each crew that represents the
-    minimum of males and females in that crew. This encourages having
-    similar numbers of each gender.
-    """
-    objective_terms = []
 
-    for center in centers:
+def add_gender_diversity_objectives(ctx: ModelContext) -> list[ObjectiveTerm]:
+    """Reward each crew having both M and F youth (``min(F_count, M_count)`` term)."""
+    objective_terms: list[ObjectiveTerm] = []
+    for center in ctx.centers:
         for crew in center.crews:
-            females_in_crew = sum(
-                person_crew[youth.name, center.name, crew.name] for youth in youth_list if youth.gender == 'F'
-            )
-            males_in_crew = sum(
-                person_crew[youth.name, center.name, crew.name] for youth in youth_list if youth.gender == 'M'
-            )
-
-            gender_balance = model.NewIntVar(0, cfg.max_crew_size, f'gender_balance_{center.name}_{crew.name}')
-            model.Add(gender_balance <= females_in_crew)
-            model.Add(gender_balance <= males_in_crew)
-            objective_terms.append(cfg.gender_weight * gender_balance)
-
+            females = _crew_attribute_sum(ctx.person_crew, ctx.regular_youth, center.name, crew.name, 'gender', 'F')
+            males = _crew_attribute_sum(ctx.person_crew, ctx.regular_youth, center.name, crew.name, 'gender', 'M')
+            if _is_zero(females) or _is_zero(males):
+                continue
+            balance = ctx.model.NewIntVar(0, ctx.cfg.max_crew_size, f'gender_balance_{center.name}_{crew.name}')
+            ctx.model.Add(balance <= females)
+            ctx.model.Add(balance <= males)
+            objective_terms.append(cast(ObjectiveTerm, ctx.cfg.gender_weight * balance))
     return objective_terms
 
 
-def add_year_diversity_objectives(
-    model: cp_model.CpModel,
-    person_crew: dict,
-    youth_list: list[Youth],
-    centers: list[Center],
-    cfg: Config,
-) -> list:
-    """
-    Rewards crews that have youth from multiple grade levels.
+def add_year_diversity_objectives(ctx: ModelContext) -> list[ObjectiveTerm]:
+    """Reward each crew having members from multiple years (Fr/So/Jr/Sr).
 
-    Adds a point for each year (Fr/So/Jr/Sr) that is represented in the crew,
-    encouraging a mix of ages rather than grouping by grade level.
-    
-    Optimized: Creates one IntVar per crew that counts total years present,
-    rather than 4 separate objective terms per crew.
+    One ``IntVar`` per crew counts how many of the four year-buckets are present.
     """
-    objective_terms = []
-    years = ['Fr', 'So', 'Jr', 'Sr']
-
-    for center in centers:
+    objective_terms: list[ObjectiveTerm] = []
+    for center in ctx.centers:
         for crew in center.crews:
-            # Track which years are present with booleans
-            year_booleans = []
-            
-            for year in years:
-                year_count = sum(
-                    person_crew[youth.name, center.name, crew.name] 
-                    for youth in youth_list if youth.year == year
-                )
-                # Boolean: is this year present in the crew?
-                has_year = model.NewBoolVar(f'has_{year}_{center.name}_{crew.name}')
-                model.Add(year_count >= 1).OnlyEnforceIf(has_year)
-                model.Add(year_count == 0).OnlyEnforceIf(has_year.Not())
+            year_booleans: list[cp_model.IntVar] = []
+            for year in YEARS:
+                year_count = _crew_attribute_sum(ctx.person_crew, ctx.regular_youth, center.name, crew.name, 'year', year)
+                if _is_zero(year_count):
+                    continue
+                has_year = ctx.model.NewBoolVar(f'has_{year}_{center.name}_{crew.name}')
+                ctx.model.Add(year_count >= 1).OnlyEnforceIf(has_year)
+                ctx.model.Add(year_count == 0).OnlyEnforceIf(has_year.Not())
                 year_booleans.append(has_year)
-            
-            # Create single IntVar that counts how many different years are present (0-4)
-            years_present = model.NewIntVar(0, 4, f'years_present_{center.name}_{crew.name}')
-            model.Add(years_present == sum(year_booleans))
-            
-            # Add single objective term per crew (instead of 4)
-            objective_terms.append(cfg.year_weight * years_present)
+
+            if not year_booleans:
+                continue
+            years_present = ctx.model.NewIntVar(0, len(YEARS), f'years_present_{center.name}_{crew.name}')
+            ctx.model.Add(years_present == sum(year_booleans))
+            objective_terms.append(cast(ObjectiveTerm, ctx.cfg.year_weight * years_present))
 
     return objective_terms
 
 
-def add_history_diversity_objectives(
-    model: cp_model.CpModel,
-    person_crew: dict,
-    youth_list: list[Youth],
-    centers: list[Center],
-    cfg: Config,
-) -> list:
-    """
-    Rewards crews that have a mix of veterans and new participants.
-
-    Creates a history_balance variable for each crew that represents the
-    minimum of veterans and new participants, encouraging a balanced mix
-    of experience levels.
-    """
-    objective_terms = []
-
-    for center in centers:
+def add_history_diversity_objectives(ctx: ModelContext) -> list[ObjectiveTerm]:
+    """Reward each crew having both Vet and New youth (``min(V, N)`` per crew)."""
+    objective_terms: list[ObjectiveTerm] = []
+    for center in ctx.centers:
         for crew in center.crews:
-            vets_in_crew = sum(
-                person_crew[youth.name, center.name, crew.name] for youth in youth_list if youth.history == 'V'
-            )
-            new_in_crew = sum(
-                person_crew[youth.name, center.name, crew.name] for youth in youth_list if youth.history == 'N'
-            )
-
-            history_balance = model.NewIntVar(0, cfg.max_crew_size, f'history_balance_{center.name}_{crew.name}')
-            model.Add(history_balance <= vets_in_crew)
-            model.Add(history_balance <= new_in_crew)
-            objective_terms.append(cfg.history_weight * history_balance)
-
+            vets = _crew_attribute_sum(ctx.person_crew, ctx.regular_youth, center.name, crew.name, 'history', 'V')
+            new = _crew_attribute_sum(ctx.person_crew, ctx.regular_youth, center.name, crew.name, 'history', 'N')
+            if _is_zero(vets) or _is_zero(new):
+                continue
+            balance = ctx.model.NewIntVar(0, ctx.cfg.max_crew_size, f'history_balance_{center.name}_{crew.name}')
+            ctx.model.Add(balance <= vets)
+            ctx.model.Add(balance <= new)
+            objective_terms.append(cast(ObjectiveTerm, ctx.cfg.history_weight * balance))
     return objective_terms
+
+
+# ----- Adult-side leader balance ----------------------------------------------
+
+
+def _add_leader_min_balance_terms(
+    ctx: ModelContext,
+    *,
+    attribute: str,
+    value_a: str,
+    value_b: str,
+    weight: int,
+    var_prefix: str,
+    upper_bound: int,
+) -> list[ObjectiveTerm]:
+    """Generic ``min(count_a, count_b)`` per crew over leaders, weighted into the objective.
+
+    Counts pre-assigned leaders as integers and flexible leaders via their
+    ``adult_crew`` Booleans, so the solver can earn diversity by routing flexible
+    adults to crews lacking the missing attribute.
+    """
+    objective_terms: list[ObjectiveTerm] = []
+    for center in ctx.centers:
+        for crew in center.crews:
+            pre_a, flex_a = crew_attribute_total(ctx, crew, center.name, attribute=attribute, value=value_a)
+            pre_b, flex_b = crew_attribute_total(ctx, crew, center.name, attribute=attribute, value=value_b)
+
+            sum_a = pre_a + sum(flex_a)
+            sum_b = pre_b + sum(flex_b)
+
+            if isinstance(sum_a, int) and sum_a == 0:
+                continue
+            if isinstance(sum_b, int) and sum_b == 0:
+                continue
+
+            balance = ctx.model.NewIntVar(0, upper_bound, f'{var_prefix}_{center.name}_{crew.name}')
+            ctx.model.Add(balance <= sum_a)
+            ctx.model.Add(balance <= sum_b)
+            objective_terms.append(cast(ObjectiveTerm, weight * balance))
+    return objective_terms
+
+
+def add_adult_leader_gender_objectives(ctx: ModelContext) -> list[ObjectiveTerm]:
+    """Reward crews whose leadership has both M and F representation."""
+    return _add_leader_min_balance_terms(
+        ctx,
+        attribute='gender', value_a='M', value_b='F',
+        weight=ctx.cfg.adult_gender_weight,
+        var_prefix='adult_gender_balance',
+        upper_bound=ctx.cfg.max_adults_per_crew,
+    )
+
+
+def add_adult_leader_history_objectives(ctx: ModelContext) -> list[ObjectiveTerm]:
+    """Reward crews whose leadership has both Vet and New representation."""
+    return _add_leader_min_balance_terms(
+        ctx,
+        attribute='history', value_a='V', value_b='N',
+        weight=ctx.cfg.adult_history_weight,
+        var_prefix='adult_history_balance',
+        upper_bound=ctx.cfg.max_adults_per_crew,
+    )

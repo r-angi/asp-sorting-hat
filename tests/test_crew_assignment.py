@@ -5,10 +5,10 @@ from ortools.sat.python import cp_model
 from pathlib import Path
 from typing import Any
 
-from src.cleaning import (
+from src.data_loaders import (
     get_centers_from_adults_df,
-    get_youth_from_buddy_form_df,
     get_historical_youth_leaders,
+    get_youth_from_buddy_form_df,
 )
 from src.config import Config
 from src.linear_program.lp_model import create_crew_assignment_model
@@ -78,7 +78,8 @@ def assignments(test_data: dict[str, Any]) -> dict[str, tuple[str, str]]:
     for youth in youth_list:
         for center in centers:
             for crew in center.crews:
-                if solver.Value(person_crew[youth.name, center.name, crew.name]) == 1:
+                key = (youth.name, center.name, crew.name)
+                if key in person_crew and solver.Value(person_crew[key]) == 1:
                     result[youth.name] = (center.name, crew.name)
                     break
     return result
@@ -94,23 +95,23 @@ def adult_assignments(test_data: dict[str, Any]) -> dict[str, tuple[str, str]]:
     unassigned_adults = test_data["unassigned_adults"]
     
     result = {}
-    
-    # Process center-only adults
-    for adult_name, center_name in center_only_adults:
-        center = next(c for c in centers if c.name == center_name)
+    centers_by_name = {c.name: c for c in centers}
+
+    for adult in center_only_adults:
+        assert adult.fixed_center is not None
+        center = centers_by_name[adult.fixed_center]
         for crew in center.crews:
-            if solver.Value(adult_crew[adult_name, center_name, crew.name]) == 1:
-                result[adult_name] = (center_name, crew.name)
+            if solver.Value(adult_crew[adult.name, center.name, crew.name]) == 1:
+                result[adult.name] = (center.name, crew.name)
                 break
-    
-    # Process unassigned adults
-    for adult_name in unassigned_adults:
+
+    for adult in unassigned_adults:
         for center in centers:
             for crew in center.crews:
-                if solver.Value(adult_crew[adult_name, center.name, crew.name]) == 1:
-                    result[adult_name] = (center.name, crew.name)
+                if solver.Value(adult_crew[adult.name, center.name, crew.name]) == 1:
+                    result[adult.name] = (center.name, crew.name)
                     break
-    
+
     return result
 
 
@@ -154,7 +155,7 @@ def test_young_adults_in_correct_crews(
         expected_center = None
         for center in centers:
             for crew in center.crews:
-                if ya.name in crew.adults:
+                if ya.name in crew.adult_names:
                     expected_center = center.name
                     expected_crew = crew.name
                     break
@@ -169,26 +170,37 @@ def test_young_adults_in_correct_crews(
 
 
 def test_crew_sizes(
-    test_data: dict[str, Any], assignments: dict[str, tuple[str, str]]
+    test_data: dict[str, Any],
+    assignments: dict[str, tuple[str, str]],
+    adult_assignments: dict[str, tuple[str, str]],
 ) -> None:
-    """Verify all crews are within min and max size constraints."""
+    """Verify all crews are within min and max size constraints.
+
+    Headcount per crew counts youth + pre-assigned adults (and YAs in crew.adults)
+    + flexible adults the solver placed via adult_crew.
+    """
     centers = test_data["centers"]
     config = test_data["config"]
     youth_list = test_data["youth_list"]
-    
-    # Count youth per crew
+
     crew_counts: dict[tuple[str, str], int] = {}
     for youth in youth_list:
+        if youth.role != "Youth":
+            continue
         center, crew = assignments[youth.name]
         crew_counts[(center, crew)] = crew_counts.get((center, crew), 0) + 1
-    
-    # Check each crew
+
+    flex_counts: dict[tuple[str, str], int] = {}
+    for _name, (center, crew) in adult_assignments.items():
+        flex_counts[(center, crew)] = flex_counts.get((center, crew), 0) + 1
+
     for center in centers:
         for crew in center.crews:
             youth_count = crew_counts.get((center.name, crew.name), 0)
-            adult_count = len(crew.adults)
-            total_size = youth_count + adult_count
-            
+            preassigned_count = len(crew.adults)
+            flex_count = flex_counts.get((center.name, crew.name), 0)
+            total_size = youth_count + preassigned_count + flex_count
+
             assert (
                 total_size >= config.min_crew_size
             ), f"Crew {center.name}/{crew.name} too small: {total_size} < {config.min_crew_size}"
@@ -215,9 +227,9 @@ def test_adult_counts(
             adult_counts[(center.name, crew.name)] = len(crew.adults)
     
     # Add center-only and unassigned adults
-    for adult_name in list(dict(center_only_adults).keys()) + unassigned_adults:
-        if adult_name in adult_assignments:
-            center, crew = adult_assignments[adult_name]
+    for adult in [*center_only_adults, *unassigned_adults]:
+        if adult.name in adult_assignments:
+            center, crew = adult_assignments[adult.name]
             adult_counts[(center, crew)] = adult_counts.get((center, crew), 0) + 1
     
     # Check constraints
@@ -244,7 +256,7 @@ def test_parent_constraints(
     for center in centers:
         for crew in center.crews:
             for adult in crew.adults:
-                parent_locations[adult] = (center.name, crew.name)
+                parent_locations[adult.name] = (center.name, crew.name)
     
     # Check youth with parents
     for youth in youth_list:
@@ -373,9 +385,9 @@ def test_past_leader_constraints(
     for center in centers:
         for crew in center.crews:
             for adult in crew.adults:
-                if adult not in leader_crews:
-                    leader_crews[adult] = []
-                leader_crews[adult].append((center.name, crew.name))
+                if adult.name not in leader_crews:
+                    leader_crews[adult.name] = []
+                leader_crews[adult.name].append((center.name, crew.name))
     
     # Check youth with past leaders
     for youth in youth_list:
@@ -425,14 +437,14 @@ def test_center_only_adults(
     """Verify center-only adults are assigned to their correct center."""
     center_only_adults = test_data["center_only_adults"]
     
-    for adult_name, expected_center in center_only_adults:
+    for adult in center_only_adults:
         assert (
-            adult_name in adult_assignments
-        ), f"Center-only adult {adult_name} not assigned"
-        actual_center, _ = adult_assignments[adult_name]
+            adult.name in adult_assignments
+        ), f"Center-only adult {adult.name} not assigned"
+        actual_center, _ = adult_assignments[adult.name]
         assert (
-            actual_center == expected_center
-        ), f"Adult {adult_name} assigned to wrong center: {actual_center} != {expected_center}"
+            actual_center == adult.fixed_center
+        ), f"Adult {adult.name} assigned to wrong center: {actual_center} != {adult.fixed_center}"
 
 
 def test_unassigned_adults(
@@ -441,13 +453,13 @@ def test_unassigned_adults(
     """Verify unassigned adults are assigned to exactly one crew."""
     unassigned_adults = test_data["unassigned_adults"]
     
-    for adult_name in unassigned_adults:
+    for adult in unassigned_adults:
         assert (
-            adult_name in adult_assignments
-        ), f"Unassigned adult {adult_name} not assigned"
-        center, crew = adult_assignments[adult_name]
-        assert center is not None, f"Adult {adult_name} has no center"
-        assert crew is not None, f"Adult {adult_name} has no crew"
+            adult.name in adult_assignments
+        ), f"Unassigned adult {adult.name} not assigned"
+        center, crew = adult_assignments[adult.name]
+        assert center is not None, f"Adult {adult.name} has no center"
+        assert crew is not None, f"Adult {adult.name} has no crew"
 
 
 def test_objectives_scored(

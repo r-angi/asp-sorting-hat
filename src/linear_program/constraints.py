@@ -1,380 +1,371 @@
-from ortools.sat.python import cp_model
-from src.models import Youth, Center
+"""CP-SAT constraint helpers for the crew-assignment model.
+
+Every helper takes a single ``ModelContext`` and posts hard constraints on
+``ctx.model``. The context bundles the cached ``at_center`` map (so we never
+recompute the per-crew sum), the sparse ``person_crew`` / ``adult_crew``
+dicts, and the typed ``Adult`` / ``Leader`` lists.
+
+Hard constraints already encoded by sparse variable construction (parent
+center, a pre-placed parent's own crew, past leaders) intentionally have no
+helper here — ``lp_model._compute_eligibility`` is the single source of truth.
+
+The exception is :func:`enforce_parent_crew_separation_constraint`, which
+covers parents whose crew is still a solver decision: the "youth not in
+parent's crew" rule must be a runtime constraint pairing ``person_crew``
+with ``adult_crew``.
+"""
+
 from typing import cast
-from src.config import Config
+
+from ortools.sat.python import cp_model
+
+from src.linear_program.adult_placement import adult_presence_at_center
+from src.linear_program.context import ModelContext
+from src.linear_program.leader_aggregates import crew_attribute_total
+from src.models import Leader, PlacementMode, Youth
 
 
-def add_one_crew_per_youth(model: cp_model.CpModel, person_crew: dict, youth_list: list[Youth], centers: list[Center]):
+# ----- Youth-side hard constraints --------------------------------------------
+
+
+def add_one_crew_per_youth(ctx: ModelContext) -> None:
+    """Each youth lands on exactly one of their eligible (center, crew) cells.
+
+    An empty eligibility list yields ``sum([]) == 1`` (infeasible) — by design,
+    so the solver reports a clear conflict instead of silently placing nobody.
     """
-    Ensures each youth is assigned to exactly one crew.
+    for y in ctx.youth_list:
+        terms = [ctx.person_crew[(y.name, c, k)] for c, k in ctx.eligibility[y.name]]
+        ctx.model.Add(sum(terms) == 1)
 
-    This is a fundamental constraint that prevents a youth from being:
-    - Unassigned (must be in at least one crew)
-    - Double-assigned (cannot be in multiple crews)
+
+def enforce_sibling_center_constraint(ctx: ModelContext) -> None:
+    """Siblings live at the same center.
+
+    Eligibility narrows to a shared subset via propagation; this constraint pins
+    them when more than one shared option remains. Each unordered pair is posted
+    once even when sibling lists are symmetric.
     """
-    for youth in youth_list:
-        if youth.role == 'Youth':
-            model.Add(
-                sum(person_crew[youth.name, center.name, crew.name] for center in centers for crew in center.crews) == 1
-            )
-        else:  # Young Adult
-            for center in centers:
-                for crew in center.crews:
-                    # If young adult is in this crew's adults list, force assignment
-                    if youth.name in crew.adults:
-                        model.Add(person_crew[youth.name, center.name, crew.name] == 1)
-                    else:
-                        model.Add(person_crew[youth.name, center.name, crew.name] == 0)
-
-
-def enforce_parent_center_constraint(
-    model: cp_model.CpModel,
-    person_crew: dict,
-    youth_list: list[Youth],
-    centers: list[Center],
-):
-    """
-    Ensures youth are assigned to the same center as their parent(s), but not the same crew.
-
-    This constraint:
-    1. Forces youth to be in the same center as their parent(s)
-    2. Prevents youth from being in their parent's crew
-    3. Raises an error if a parent is not found in any center
-    4. Assumes all parents of the same child are at the same center (guaranteed by data)
-    """
-    # Pre-compute adult names and their center mappings for efficiency
-    adult_names = set()
-    adult_to_center = {}
-    for center in centers:
-        for crew in center.crews:
-            for adult in crew.adults:
-                adult_names.add(adult)
-                adult_to_center[adult] = center
-
-    for youth in youth_list:
-        if youth.parent_names_list:
-            # Check that all parents exist in adult crews
-            for parent_name in youth.parent_names_list:
-                if parent_name not in adult_names:
-                    raise ValueError(f'Parent {parent_name} not found in any center for {youth.name}')
-
-            # Find the center where parents are located (use pre-computed mapping)
-            parent_center = adult_to_center.get(youth.parent_names_list[0])
-
-            if parent_center:
-                # Youth must be assigned to the parent's center (computed from crew assignments)
-                youth_at_parent_center = sum(
-                    person_crew[youth.name, parent_center.name, crew.name] 
-                    for crew in parent_center.crews
+    processed: set[tuple[str, str]] = set()
+    for y in ctx.youth_list:
+        for sibling in y.siblings_list:
+            if sibling not in ctx.youth_dict:
+                continue
+            pair = cast(tuple[str, str], tuple(sorted([y.name, sibling])))
+            if pair in processed:
+                continue
+            processed.add(pair)
+            for center in ctx.centers:
+                ctx.model.Add(
+                    ctx.at_center[(y.name, center.name)]
+                    == ctx.at_center[(sibling, center.name)]
                 )
-                model.Add(youth_at_parent_center == 1)
-
-                # Prevent youth from being in same crew as any parent
-                for crew in parent_center.crews:
-                    for parent_name in youth.parent_names_list:
-                        if parent_name in crew.adults:
-                            model.Add(person_crew[youth.name, parent_center.name, crew.name] == 0)
 
 
-def enforce_sibling_center_constraint(
-    model: cp_model.CpModel, person_crew: dict, youth_list: list[Youth], centers: list[Center], youth_dict: dict
-):
+def enforce_sibling_crew_separation_constraint(ctx: ModelContext) -> None:
+    """Siblings cannot share a crew. Each unordered pair processed once."""
+    processed: set[tuple[str, str]] = set()
+    for y in ctx.youth_list:
+        for sibling in y.siblings_list:
+            if sibling not in ctx.youth_dict:
+                continue
+            pair = cast(tuple[str, str], tuple(sorted([y.name, sibling])))
+            if pair in processed:
+                continue
+            processed.add(pair)
+            for center in ctx.centers:
+                for crew in center.crews:
+                    a = ctx.person_crew.get((y.name, center.name, crew.name))
+                    b = ctx.person_crew.get((sibling, center.name, crew.name))
+                    if a is None or b is None:
+                        continue
+                    ctx.model.Add(a + b <= 1)
+
+
+def enforce_parent_crew_separation_constraint(ctx: ModelContext) -> None:
+    """Youth cannot share a crew with a parent whose crew is solver-assigned.
+
+    For a parent already placed in a specific crew, the parent's exact
+    ``(center, crew)`` is pruned from the youth's eligibility upstream (no
+    ``person_crew`` Boolean exists for that cell). This helper handles the
+    remaining parents — those with only a center on the crews CSV (or no
+    placement at all) — by pairing
+    ``person_crew[(youth, c, k)] + adult_crew[(parent, c, k)] <= 1`` over
+    every (center, crew) the parent could land on.
     """
-    Ensures siblings are assigned to the same center.
+    for youth in ctx.youth_list:
+        for parent_name in youth.parent_names_list:
+            leader = ctx.leaders_by_name.get(parent_name)
+            if leader is None or leader.placement == PlacementMode.FIXED:
+                continue
 
-    This keeps families together at the same worksite while still allowing
-    siblings to be in different crews within that center.
+            fixed_center = leader.fixed_center
+            for center in ctx.centers:
+                if fixed_center is not None and fixed_center != center.name:
+                    continue
+                for crew in center.crews:
+                    picker = ctx.person_crew.get((youth.name, center.name, crew.name))
+                    parent_var = ctx.adult_crew.get((parent_name, center.name, crew.name))
+                    if picker is None or parent_var is None:
+                        continue
+                    ctx.model.Add(picker + parent_var <= 1)
+
+
+def enforce_friend_separation_constraint(ctx: ModelContext) -> None:
+    """Buddy picks may not share a crew with the picker.
+
+    Applied uniformly to youth-youth and youth-adult pairs. For an adult buddy:
+    pre-assigned (FIXED) → forbid the picker from that exact crew; flexible →
+    pair the picker's BoolVar with the adult's adult_crew BoolVar.
     """
-    for youth in youth_list:
-        for sibling in youth.siblings_list:
-            if sibling in youth_dict:
-                for center in centers:
-                    # Sum of crew assignments equals 1 if person is at center, 0 otherwise
-                    youth_at_center = sum(
-                        person_crew[youth.name, center.name, crew.name] 
-                        for crew in center.crews
-                    )
-                    sibling_at_center = sum(
-                        person_crew[sibling, center.name, crew.name] 
-                        for crew in center.crews
-                    )
-                    model.Add(youth_at_center == sibling_at_center)
+    processed_youth_pairs: set[tuple[str, str]] = set()
+    processed_youth_adult: set[tuple[str, str]] = set()
 
-
-def enforce_sibling_crew_separation_constraint(
-    model: cp_model.CpModel, person_crew: dict, youth_list: list[Youth], centers: list[Center], youth_dict: dict
-):
-    """
-    Prevents siblings from being assigned to the same crew.
-
-    This ensures that while siblings are at the same center (enforced by
-    enforce_sibling_center_constraint), they are placed in different crews.
-
-    Optimized to avoid duplicate constraints by only processing each sibling pair once.
-    """
-    processed_pairs = set()
-
-    for youth in youth_list:
-        for sibling in youth.siblings_list:
-            if sibling in youth_dict:
-                # Create a canonical pair representation to avoid duplicates
-                pair = tuple(sorted([youth.name, sibling]))
-                if pair not in processed_pairs:
-                    processed_pairs.add(pair)
-
-                    for center in centers:
-                        for crew in center.crews:
-                            model.Add(
-                                person_crew[youth.name, center.name, crew.name]
-                                + person_crew[sibling, center.name, crew.name]
-                                <= 1
-                            )
-
-
-def enforce_friend_separation_constraint(
-    model: cp_model.CpModel, person_crew: dict, youth_list: list[Youth], centers: list[Center], youth_dict: dict
-):
-    """
-    Prevents friends from being assigned to the same crew.
-
-    This encourages youth to meet new people and prevents cliques from forming.
-    It applies to all friend choices (first, second, and third choices).
-
-    Optimized to avoid duplicate constraints by only processing each friend pair once.
-    """
-    processed_pairs = set()
-
-    for youth in youth_list:
-        choices = [youth.first_choice, youth.second_choice, youth.third_choice]
-        choices = [c for c in choices if c is not None]
+    for youth in ctx.youth_list:
+        choices: list[str] = [
+            c for c in (youth.first_choice, youth.second_choice, youth.third_choice) if c is not None
+        ]
         for friend in choices:
-            if friend in youth_dict:
-                # Create a canonical pair representation to avoid duplicates
-                pair = tuple(sorted([youth.name, cast(str, friend)]))
-                if pair not in processed_pairs:
-                    processed_pairs.add(pair)
+            if friend in ctx.youth_dict:
+                pair = cast(tuple[str, str], tuple(sorted([youth.name, friend])))
+                if pair in processed_youth_pairs:
+                    continue
+                processed_youth_pairs.add(pair)
+                for center in ctx.centers:
+                    for crew in center.crews:
+                        a = ctx.person_crew.get((youth.name, center.name, crew.name))
+                        b = ctx.person_crew.get((friend, center.name, crew.name))
+                        if a is None or b is None:
+                            continue
+                        ctx.model.Add(a + b <= 1)
+            elif friend in ctx.leaders_by_name:
+                key = (youth.name, friend)
+                if key in processed_youth_adult:
+                    continue
+                processed_youth_adult.add(key)
 
-                    for center in centers:
-                        for crew in center.crews:
-                            model.Add(
-                                person_crew[youth.name, center.name, crew.name]
-                                + person_crew[friend, center.name, crew.name]
-                                <= 1
-                            )
+                leader = ctx.leaders_by_name[friend]
+                fixed_center = leader.fixed_center
+                for center in ctx.centers:
+                    if fixed_center is not None and fixed_center != center.name:
+                        continue
+                    for crew in center.crews:
+                        picker = ctx.person_crew.get((youth.name, center.name, crew.name))
+                        if picker is None:
+                            continue
+                        if leader.placement == PlacementMode.FIXED:
+                            if friend in crew.adult_names:
+                                ctx.model.Add(picker == 0)
+                            continue
+                        adult_var = ctx.adult_crew.get((friend, center.name, crew.name))
+                        if adult_var is not None:
+                            ctx.model.Add(picker + adult_var <= 1)
 
 
-def enforce_friend_center_constraint(
-    model: cp_model.CpModel, person_crew: dict, youth_list: list[Youth], centers: list[Center], youth_dict: dict
-):
+def enforce_friend_center_constraint(ctx: ModelContext) -> None:
+    """At least one buddy choice (roster youth or adult/YA leader) must end up
+    at the youth's center.
+
+    Pairs with friend_separation to give "same center, different crew" semantics.
     """
-    Ensures youth are assigned to centers with at least one of their friend choices.
-
-    This balances the friend separation constraint by guaranteeing that while
-    friends can't be in the same crew, they will at least be at the same worksite
-    and can interact during non-work times.
-    """
-    for youth in youth_list:
+    for youth in ctx.youth_list:
         choices = [youth.first_choice, youth.second_choice, youth.third_choice]
-        valid_choices = [c for c in choices if c is not None and c in youth_dict]
-        if valid_choices:
-            for center in centers:
-                # Youth at center (computed from crew assignments)
-                youth_at_center = sum(
-                    person_crew[youth.name, center.name, crew.name]
-                    for crew in center.crews
+        youth_choices = [c for c in choices if c is not None and c in ctx.youth_dict]
+        adult_choices = [
+            c for c in choices if c is not None and c not in ctx.youth_dict and c in ctx.leaders_by_name
+        ]
+        if not youth_choices and not adult_choices:
+            continue
+
+        for center in ctx.centers:
+            youth_at_center = ctx.at_center[(youth.name, center.name)]
+
+            friend_terms: list[cp_model.IntVar | cp_model.LinearExpr | int] = [
+                ctx.at_center[(friend, center.name)] for friend in youth_choices
+            ]
+            for adult_name in adult_choices:
+                presence = adult_presence_at_center(
+                    ctx.leaders_by_name[adult_name], center, ctx.adult_crew
                 )
-                # Friends at center (computed from crew assignments)
-                friends_at_center = sum(
-                    person_crew[friend, center.name, crew.name]
-                    for friend in valid_choices
-                    for crew in center.crews
-                )
-                model.Add(youth_at_center <= friends_at_center)
+                if presence is None:
+                    continue
+                friend_terms.append(presence)
+
+            ctx.model.Add(youth_at_center <= sum(friend_terms))
 
 
-def enforce_crew_size_constraints(
-    model: cp_model.CpModel,
-    person_crew: dict,
-    youth_list: list[Youth],
-    centers: list[Center],
-    config: Config,
-):
-    """
-    Enforces minimum and maximum crew size constraints.
-
-    This ensures:
-    1. Each crew has enough people to be effective (min_crew_size)
-    2. No crew is too large to manage (max_crew_size)
-    3. Counts both youth and existing adults in the size calculations
-    4. Links crew assignments to center assignments for consistency
-    """
-    for center in centers:
-        for crew in center.crews:
-            # Count regular youth in crew (youth_list is already filtered to regular youth)
-            youth_in_crew = sum(person_crew[youth.name, center.name, crew.name] for youth in youth_list)
-
-            # Count all adults (including young adults) in crew
-            current_adult_count = len(crew.adults)
-
-            # Size constraints including adults
-            model.Add(youth_in_crew + current_adult_count >= config.min_crew_size)
-            model.Add(youth_in_crew + current_adult_count <= config.max_crew_size)
-
-
-def enforce_past_leader_constraint(
-    model: cp_model.CpModel,
-    person_crew: dict,
-    youth_list: list[Youth],
-    centers: list[Center],
-):
-    """
-    Prevents youth from being assigned to crews led by their past leaders.
-
-    This constraint ensures youth don't repeat experiences with the same adult leaders,
-    encouraging them to work with different adults each year.
-    """
-    for youth in youth_list:
-        if youth.past_leaders:  # Only apply if youth has past leaders
-            for center in centers:
-                for crew in center.crews:
-                    # Check if any of youth's past leaders are in this crew
-                    if any(leader in crew.adults for leader in youth.past_leaders):
-                        model.Add(person_crew[youth.name, center.name, crew.name] == 0)
-
-
-def enforce_supervision_group_limit(
-    model: cp_model.CpModel,
-    person_crew: dict,
-    youth_list: list[Youth],
-    centers: list[Center],
-    max_per_center: int = 2,
-):
-    """Limit members of each supervision group to max_per_center per center.
-    
-    Each supervision group (A, B, C, etc.) is constrained independently.
-    Example: With max_per_center=2 and groups A, B:
-      - Center Fayette can have at most 2 from group A AND at most 2 from group B
-    """
-    # Group youth by supervision_group
+def enforce_supervision_group_limit(ctx: ModelContext, max_per_center: int = 2) -> None:
+    """Each supervision group (A, B, C, ...) is independently capped per center."""
     groups: dict[str, list[Youth]] = {}
-    for youth in youth_list:
+    for youth in ctx.youth_list:
         if youth.supervision_group:
             groups.setdefault(youth.supervision_group, []).append(youth)
-    
-    # Add constraint for each group/center combination
-    for group_name, group_youth in groups.items():
-        for center in centers:
-            # Count group members at this center (computed from crew assignments)
-            group_at_center = sum(
-                person_crew[y.name, center.name, crew.name]
-                for y in group_youth
+
+    for group_youth in groups.values():
+        for center in ctx.centers:
+            total = sum(ctx.at_center[(y.name, center.name)] for y in group_youth)
+            ctx.model.Add(total <= max_per_center)
+
+
+def enforce_anti_buddy_constraint(ctx: ModelContext) -> None:
+    """Prevent anti-buddies from being at the same center."""
+    processed: set[tuple[str, str]] = set()
+    for youth in ctx.youth_list:
+        for anti in youth.anti_buddy_list:
+            if anti not in ctx.youth_dict:
+                continue
+            pair = cast(tuple[str, str], tuple(sorted([youth.name, anti])))
+            if pair in processed:
+                continue
+            processed.add(pair)
+            for center in ctx.centers:
+                ctx.model.Add(
+                    ctx.at_center[(youth.name, center.name)]
+                    + ctx.at_center[(anti, center.name)]
+                    <= 1
+                )
+
+
+# ----- Adult-side: placement, headcount, driver, new+vet ----------------------
+
+
+def assign_center_only_adults(ctx: ModelContext) -> None:
+    """Each center-only leader lands on exactly one crew within their fixed center."""
+    for leader in ctx.center_only_adults:
+        assert leader.fixed_center is not None
+        center = ctx.centers_by_name[leader.fixed_center]
+        ctx.model.Add(
+            sum(ctx.adult_crew[(leader.name, center.name, crew.name)] for crew in center.crews) == 1
+        )
+
+
+def assign_unassigned_adults(ctx: ModelContext) -> None:
+    """Each unassigned leader lands on exactly one crew across all centers."""
+    for leader in ctx.unassigned_adults:
+        ctx.model.Add(
+            sum(
+                ctx.adult_crew[(leader.name, center.name, crew.name)]
+                for center in ctx.centers
                 for crew in center.crews
             )
-            model.Add(group_at_center <= max_per_center)
-
-
-def enforce_anti_buddy_constraint(
-    model: cp_model.CpModel,
-    person_crew: dict,
-    youth_list: list[Youth],
-    centers: list[Center],
-    youth_dict: dict[str, Youth],
-):
-    """Prevent anti-buddies from being at the same center."""
-    processed_pairs: set[tuple[str, str]] = set()
-    
-    for youth in youth_list:
-        for anti_buddy in youth.anti_buddy_list:
-            if anti_buddy in youth_dict:
-                pair = tuple(sorted([youth.name, anti_buddy]))
-                if pair not in processed_pairs:
-                    processed_pairs.add(pair)
-                    for center in centers:
-                        # Youth at center (computed from crew assignments)
-                        youth_at_center = sum(
-                            person_crew[youth.name, center.name, crew.name]
-                            for crew in center.crews
-                        )
-                        anti_buddy_at_center = sum(
-                            person_crew[anti_buddy, center.name, crew.name]
-                            for crew in center.crews
-                        )
-                        model.Add(youth_at_center + anti_buddy_at_center <= 1)
-
-
-def assign_center_only_adults(
-    model: cp_model.CpModel,
-    adult_crew: dict,
-    center_only_adults: list[tuple[str, str]],  # (name, center)
-    centers: list[Center],
-):
-    """Assign center-only adults to exactly one crew within their center.
-    
-    These are adults who are pre-assigned to a center but not a specific crew.
-    The algorithm will assign them to exactly one crew in their center.
-    """
-    for adult_name, center_name in center_only_adults:
-        center = next(c for c in centers if c.name == center_name)
-        # Must be assigned to exactly one crew in their center
-        model.Add(
-            sum(adult_crew[adult_name, center_name, crew.name] 
-                for crew in center.crews) == 1
+            == 1
         )
 
 
-def assign_unassigned_adults(
-    model: cp_model.CpModel,
-    adult_crew: dict,
-    unassigned_adults: list[str],
-    centers: list[Center],
-):
-    """Assign unassigned adults to exactly one crew across all centers.
-    
-    These are adults with no center or crew assignment.
-    The algorithm will assign them to any crew in any center.
-    """
-    for adult_name in unassigned_adults:
-        # Must be assigned to exactly one crew across all centers
-        model.Add(
-            sum(adult_crew[adult_name, center.name, crew.name]
-                for center in centers
-                for crew in center.crews) == 1
-        )
+def enforce_crew_headcount(ctx: ModelContext) -> None:
+    """Combined min/max bounds on crew headcount and per-crew adult count.
 
+    - Total headcount: youth + pre-assigned leaders + flexible leaders the solver
+      places, bounded by ``min_crew_size`` / ``max_crew_size``.
+    - Adult headcount: pre-assigned leaders + flexible leaders (Adult or YA),
+      bounded by ``min_adults_per_crew`` / ``max_adults_per_crew``.
 
-def enforce_adult_count_constraints(
-    model: cp_model.CpModel,
-    adult_crew: dict,
-    center_only_adults: list[tuple[str, str]],
-    unassigned_adults: list[str],
-    centers: list[Center],
-    config: Config,
-):
-    """Enforce minimum and maximum adult count per crew.
-    
-    Ensures each crew has adequate supervision (min) without too many leaders (max).
-    Counts pre-assigned adults, center-only adults, and unassigned adults.
+    Both sides reuse the same precomputed flex indicator list per crew, so the
+    iteration walks each ``(center, crew)`` once.
     """
-    for center in centers:
+    cfg = ctx.cfg
+    for center in ctx.centers:
         for crew in center.crews:
-            # Count pre-assigned adults in this crew
-            pre_assigned_count = len(crew.adults)
-            
-            # Count center-only adults that could be assigned to this crew
-            center_only_in_crew = sum(
-                adult_crew[adult_name, center.name, crew.name]
-                for adult_name, center_name in center_only_adults
-                if center_name == center.name
-            )
-            
-            # Count unassigned adults that could be assigned to this crew
-            unassigned_in_crew = sum(
-                adult_crew[adult_name, center.name, crew.name]
-                for adult_name in unassigned_adults
-            )
-            
-            total_adults = pre_assigned_count + center_only_in_crew + unassigned_in_crew
-            
-            # Enforce min/max adult constraints
-            model.Add(total_adults >= config.min_adults_per_crew)
-            model.Add(total_adults <= config.max_adults_per_crew)
+            preassigned = len(crew.adults)
+            flex_indicators: list[cp_model.IntVar] = []
+            for leader in ctx.center_only_adults:
+                if leader.fixed_center != center.name:
+                    continue
+                var = ctx.adult_crew.get((leader.name, center.name, crew.name))
+                if var is not None:
+                    flex_indicators.append(var)
+            for leader in ctx.unassigned_adults:
+                var = ctx.adult_crew.get((leader.name, center.name, crew.name))
+                if var is not None:
+                    flex_indicators.append(var)
+
+            youth_terms = [
+                ctx.person_crew[(y.name, center.name, crew.name)]
+                for y in ctx.regular_youth
+                if (y.name, center.name, crew.name) in ctx.person_crew
+            ]
+
+            adult_total = preassigned + sum(flex_indicators)
+            total_headcount = sum(youth_terms) + adult_total
+
+            ctx.model.Add(total_headcount >= cfg.min_crew_size)
+            ctx.model.Add(total_headcount <= cfg.max_crew_size)
+            ctx.model.Add(adult_total >= cfg.min_adults_per_crew)
+            ctx.model.Add(adult_total <= cfg.max_adults_per_crew)
+
+
+def enforce_driver_per_crew(ctx: ModelContext) -> None:
+    """At least one ``role == 'Adult'`` (driver) on every crew.
+
+    Young Adults are excluded — they cannot drive.
+    """
+    for center in ctx.centers:
+        for crew in center.crews:
+            pre, flex = crew_attribute_total(ctx, crew, center.name, attribute='role', value='Adult')
+            ctx.model.Add(pre + sum(flex) >= 1)
+
+
+def enforce_new_requires_vet(ctx: ModelContext) -> None:
+    """If a crew has a New leader, it must also have a Vet leader.
+
+    Reified per crew so the constraint is vacuous on crews with no New leaders.
+    Counts both Adults and Young Adults on each side.
+    """
+    for center in ctx.centers:
+        for crew in center.crews:
+            pre_new, flex_new = crew_attribute_total(ctx, crew, center.name, attribute='history', value='N')
+            pre_vet, flex_vet = crew_attribute_total(ctx, crew, center.name, attribute='history', value='V')
+
+            sum_new = pre_new + sum(flex_new)
+            sum_vet = pre_vet + sum(flex_vet)
+
+            if isinstance(sum_new, int):
+                if sum_new == 0:
+                    continue
+                ctx.model.Add(sum_vet >= 1)
+                continue
+
+            has_new = ctx.model.NewBoolVar(f'has_new_leader_{center.name}_{crew.name}')
+            ctx.model.Add(sum_new >= 1).OnlyEnforceIf(has_new)
+            ctx.model.Add(sum_new == 0).OnlyEnforceIf(has_new.Not())
+            ctx.model.Add(sum_vet >= 1).OnlyEnforceIf(has_new)
+
+
+def break_symmetry_unassigned_adults(ctx: ModelContext) -> None:
+    """Lex-order interchangeable unassigned leaders (same role/gender/history).
+
+    Anchors each interchangeable group by forcing the alphabetically-earlier
+    name to land on a lower-or-equal flat crew index than the next one. Adults
+    and Young Adults form separate groups via the ``role`` key, so the rule
+    never mixes them.
+    """
+    if not ctx.unassigned_adults:
+        return
+
+    flat_crews: list[tuple[str, str]] = [
+        (center.name, crew.name) for center in ctx.centers for crew in center.crews
+    ]
+    if len(flat_crews) <= 1:
+        return
+
+    groups: dict[tuple[str, str | None, str | None], list[Leader]] = {}
+    for leader in ctx.unassigned_adults:
+        groups.setdefault((leader.role, leader.gender, leader.history), []).append(leader)
+
+    for leaders in groups.values():
+        if len(leaders) < 2:
+            continue
+        ordered = sorted(leaders, key=lambda a: a.name)
+        index_terms: list[cp_model.LinearExpr | int | None] = []
+        for leader in ordered:
+            terms: list[cp_model.LinearExpr] = [
+                cast(cp_model.LinearExpr, idx * ctx.adult_crew[(leader.name, center_name, crew_name)])
+                for idx, (center_name, crew_name) in enumerate(flat_crews)
+                if (leader.name, center_name, crew_name) in ctx.adult_crew
+            ]
+            index_terms.append(cast(cp_model.LinearExpr, sum(terms)) if terms else None)
+
+        for prev, curr in zip(index_terms, index_terms[1:]):
+            if prev is None or curr is None:
+                continue
+            ctx.model.Add(prev <= curr)
