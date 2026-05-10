@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from typing import Self
 
 
 @dataclass
@@ -8,12 +9,12 @@ class CenterConfig:
     crew_count: int | None = None  # None = extract from CSV
 
     @classmethod
-    def parse(cls, spec: str) -> 'CenterConfig':
+    def parse(cls, spec: str) -> Self:
         """Parse 'CenterName' or 'CenterName:count' format."""
         if ':' in spec:
             name, count = spec.split(':', 1)
-            return cls(name=name, crew_count=int(count))
-        return cls(name=spec)
+            return cls(name=name.strip(), crew_count=int(count.strip()))
+        return cls(name=spec.strip())
 
 
 @dataclass
@@ -28,31 +29,66 @@ class Config:
 
     # Objective weights
     friend_weight: int = 2  # Weight for friend preferences
-    gender_weight: int = 1  # Weight for gender diversity
-    year_weight: int = 1  # Weight for year diversity
-    history_weight: int = 1  # Weight for vet/new diversity
+    gender_weight: int = 1  # Weight for youth gender diversity
+    year_weight: int = 1  # Weight for youth year diversity
+    history_weight: int = 1  # Weight for youth vet/new diversity
+    adult_gender_weight: int = 1  # Weight for adult-leader M/F balance per crew
+    adult_history_weight: int = 1  # Weight for adult-leader vet/new balance per crew
+    # Same-center buddy preference toward an Adult/Young Adult on crews CSV (None mirrors friend_weight).
+    adult_friend_weight: int | None = None
+
+    # CP-SAT solver hyperparameters (used by main.py orchestration; tests can override).
+    solver_max_time_seconds: float = 300.0
+    solver_num_workers: int = 8
+    solver_relative_gap_limit: float = 0.005
+    solver_log_progress: bool = True
+
+    def __post_init__(self) -> None:
+        if self.adult_friend_weight is None:
+            self.adult_friend_weight = self.friend_weight
 
     @classmethod
-    def default(cls) -> 'Config':
+    def default(cls) -> Self:
         """Get default configuration."""
         return cls()
 
     @classmethod
-    def with_high_friend_weight(cls) -> 'Config':
+    def with_high_friend_weight(cls) -> Self:
         """Configuration that prioritizes friend preferences."""
         return cls(
             friend_weight=4,
+            adult_friend_weight=4,
             gender_weight=1,
             year_weight=1,
             history_weight=1,
         )
 
     @classmethod
-    def with_high_diversity(cls) -> 'Config':
+    def with_high_diversity(cls) -> Self:
         """Configuration that prioritizes diversity metrics."""
         return cls(
             friend_weight=1,
+            adult_friend_weight=1,
             gender_weight=2,
             year_weight=2,
             history_weight=2,
+            adult_gender_weight=2,
+            adult_history_weight=2,
+        )
+
+    @classmethod
+    def with_fast(cls) -> Self:
+        """Quick-feedback config for development; trades solution quality for wall-clock."""
+        return cls(
+            solver_max_time_seconds=60.0,
+            solver_relative_gap_limit=0.05,
+            solver_log_progress=False,
+        )
+
+    @classmethod
+    def with_optimal(cls) -> Self:
+        """Push solver toward proven optimality at the cost of wall-clock."""
+        return cls(
+            solver_max_time_seconds=1800.0,
+            solver_relative_gap_limit=0.001,
         )

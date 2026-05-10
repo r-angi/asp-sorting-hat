@@ -1,40 +1,34 @@
 from collections import defaultdict
+from typing import Any
 
 import matplotlib.pyplot as plt
-import networkx as nx
+import networkx as nx  # type: ignore[import-untyped]
 import numpy as np
 from community import community_louvain  # type: ignore
-from ortools.sat.python import cp_model
 
+from src.analysis import PersonCrew, SolverLike, is_person_at_center
 from src.models import Center, Youth
 
-
-def is_person_at_center(
-    solver: cp_model.CpSolver,
-    person_crew: dict,
-    person_name: str,
-    center: Center,
-) -> bool:
-    """Helper function to check if a person is at a center based on crew assignments."""
-    for crew in center.crews:
-        if solver.Value(person_crew[person_name, center.name, crew.name]) == 1:
-            return True
-    return False
+__all__ = ('is_person_at_center', 'analyze_clusters', 'detect_friend_clusters')
 
 
 def detect_friend_clusters(youth_list: list[Youth]) -> dict[str, int]:
     """Detect friend clusters using Louvain community detection.
 
-    Uses only buddy form friend choices - completely independent of assignments.
+    Uses only buddy form friend choices — completely independent of assignments.
+    Edges are restricted to roster youth on both ends so leader picks (which
+    appear in friend choice fields) do not introduce phantom nodes that would
+    distort cluster sizes and cohesion scores.
     Returns mapping of youth name -> cluster_id.
     """
+    roster: set[str] = {y.name for y in youth_list}
     G = nx.Graph()
 
     for youth in youth_list:
         G.add_node(youth.name)
         weights = {youth.first_choice: 3, youth.second_choice: 2, youth.third_choice: 1}
         for friend, weight in weights.items():
-            if friend:
+            if friend and friend in roster:
                 G.add_edge(youth.name, friend, weight=weight)
 
     return community_louvain.best_partition(G, weight='weight')
@@ -42,10 +36,10 @@ def detect_friend_clusters(youth_list: list[Youth]) -> dict[str, int]:
 
 def calculate_cluster_cohesion(
     clusters: dict[str, int],
-    solver: cp_model.CpSolver,
-    person_crew: dict,
+    solver: SolverLike,
+    person_crew: PersonCrew,
     centers: list[Center],
-) -> dict[str, dict]:
+) -> dict[str, dict[str, Any]]:
     """Analyze how well clusters were kept together in center assignments.
 
     Returns per-cluster metrics including:
@@ -77,7 +71,8 @@ def calculate_cluster_cohesion(
 
 
 def _build_friend_graph(youth_list: list[Youth]) -> nx.DiGraph:
-    """Build directed graph of friend choices with weights."""
+    """Build directed graph of friend choices, restricted to roster youth on both ends."""
+    roster: set[str] = {y.name for y in youth_list}
     G = nx.DiGraph()
 
     for youth in youth_list:
@@ -88,7 +83,7 @@ def _build_friend_graph(youth_list: list[Youth]) -> nx.DiGraph:
             (youth.third_choice, 1),
         ]
         for friend, weight in choices:
-            if friend:
+            if friend and friend in roster:
                 G.add_edge(youth.name, friend, weight=weight)
 
     return G
@@ -96,13 +91,13 @@ def _build_friend_graph(youth_list: list[Youth]) -> nx.DiGraph:
 
 def visualize_cluster_distribution(
     clusters: dict[str, int],
-    cohesion_data: dict[str, dict],
+    cohesion_data: dict[str, dict[str, Any]],
     centers: list[Center],
-    solver: cp_model.CpSolver,
-    person_crew: dict,
+    solver: SolverLike,
+    person_crew: PersonCrew,
     youth_list: list[Youth],
     output_path: str = 'cluster_analysis.png',
-):
+) -> None:
     """Create comprehensive 4-panel visualization of friend clusters and center assignments.
 
     Panel 1: Bar chart showing cluster distribution across centers with cohesion scores
@@ -110,6 +105,10 @@ def visualize_cluster_distribution(
     Panel 3: Grid of clusters (5 per row), each showing members colored by center
     Panel 4: Columns of centers (side-by-side), each showing members colored by cluster
     """
+    if not centers:
+        print(f'Skipping {output_path}: cluster visualization requires at least one center.')
+        return
+
     # Get unique cluster IDs and sort by size
     cluster_sizes = [(cid, data['size']) for cid, data in cohesion_data.items()]
     cluster_sizes.sort(key=lambda x: x[1], reverse=True)
@@ -493,12 +492,12 @@ def visualize_cluster_distribution(
 
 def analyze_clusters(
     youth_list: list[Youth],
-    solver: cp_model.CpSolver,
-    person_crew: dict,
+    solver: SolverLike,
+    person_crew: PersonCrew,
     centers: list[Center],
     year: int | None = None,
     output_dir: str = '.',
-) -> dict:
+) -> dict[str, Any]:
     """Full cluster analysis pipeline."""
     print('\n' + '=' * 50)
     print('CLUSTER ANALYSIS')
@@ -507,9 +506,15 @@ def analyze_clusters(
     clusters = detect_friend_clusters(youth_list)
     cohesion = calculate_cluster_cohesion(clusters, solver, person_crew, centers)
 
-    # Include year in filename if provided
-    filename = f'cluster_analysis_{year}.png' if year else 'cluster_analysis.png'
-    visualize_cluster_distribution(clusters, cohesion, centers, solver, person_crew, youth_list, f'{output_dir}/{filename}')
+    if not cohesion:
+        print('No friend clusters detected (empty youth list).')
+        return {'num_clusters': 0, 'avg_cohesion': 0.0, 'cluster_details': {}}
+
+    if centers:
+        filename = f'cluster_analysis_{year}.png' if year else 'cluster_analysis.png'
+        visualize_cluster_distribution(clusters, cohesion, centers, solver, person_crew, youth_list, f'{output_dir}/{filename}')
+    else:
+        print('Skipping cluster visualization: no centers available to plot against.')
 
     avg_cohesion = sum(c['cohesion_score'] for c in cohesion.values()) / len(cohesion)
     num_clusters = len(set(clusters.values()))
