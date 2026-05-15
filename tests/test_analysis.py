@@ -10,10 +10,14 @@ from pathlib import Path
 import polars as pl
 import pytest
 
-import main as main_mod
-from main import load_existing_assignments
+from main import (
+    allocate_next_versioned_run_dir,
+    load_assignments_from_csv,
+    normalize_run_version_label,
+)
 from src.analysis import (
     calculate_friend_choice_stats,
+    calculate_friend_match_buckets,
     calculate_friend_scores,
     synthesize_centers_from_assignments,
 )
@@ -41,6 +45,62 @@ def test_calculate_friend_choice_stats_empty_youth_returns_zero_pcts() -> None:
         'second_choice_pct': 0.0,
         'third_choice_pct': 0.0,
         'multiple_friends_pct': 0.0,
+    }
+
+
+def test_calculate_friend_match_buckets_empty_inputs_return_zero_buckets() -> None:
+    centers = [Center(name='Fayette', crews=[Crew(name='F01')])]
+    buckets = calculate_friend_match_buckets(_FakeSolver(), {}, [], centers)
+    assert buckets == {'Fayette': {0: 0, 1: 0, 2: 0, 3: 0}}
+
+
+def test_calculate_friend_match_buckets_counts_same_center_friend_picks() -> None:
+    """A 3-youth crew at one center: anchor matches all three picks; friends match 1 pick each."""
+    centers = [Center(name='Fayette', crews=[Crew(name='F01')])]
+    youth_list = [
+        Youth(name='Anna', year='Fr', gender='F', history='N',
+              first_choice='Bob',  second_choice='Cara', third_choice='Dan'),
+        Youth(name='Bob',  year='So', gender='M', history='V',
+              first_choice='Anna', second_choice=None,   third_choice=None),
+        Youth(name='Cara', year='Jr', gender='F', history='V',
+              first_choice='Anna', second_choice=None,   third_choice=None),
+        Youth(name='Dan',  year='Sr', gender='M', history='N',
+              first_choice=None,   second_choice=None,   third_choice=None),
+    ]
+    person_crew: dict[tuple[str, str, str], int] = {
+        ('Anna', 'Fayette', 'F01'): 1,
+        ('Bob',  'Fayette', 'F01'): 1,
+        ('Cara', 'Fayette', 'F01'): 1,
+        ('Dan',  'Fayette', 'F01'): 1,
+    }
+
+    buckets = calculate_friend_match_buckets(_FakeSolver(), person_crew, youth_list, centers)
+
+    assert buckets == {'Fayette': {0: 1, 1: 2, 2: 0, 3: 1}}
+
+
+def test_calculate_friend_match_buckets_ignores_cross_center_picks() -> None:
+    """Friend picks landing at a different center don't count as same-center matches."""
+    centers = [
+        Center(name='A', crews=[Crew(name='A1')]),
+        Center(name='B', crews=[Crew(name='B1')]),
+    ]
+    youth_list = [
+        Youth(name='Anna', year='Fr', gender='F', history='N',
+              first_choice='Bob', second_choice=None, third_choice=None),
+        Youth(name='Bob',  year='So', gender='M', history='V',
+              first_choice='Anna', second_choice=None, third_choice=None),
+    ]
+    person_crew: dict[tuple[str, str, str], int] = {
+        ('Anna', 'A', 'A1'): 1,
+        ('Bob',  'B', 'B1'): 1,
+    }
+
+    buckets = calculate_friend_match_buckets(_FakeSolver(), person_crew, youth_list, centers)
+
+    assert buckets == {
+        'A': {0: 1, 1: 0, 2: 0, 3: 0},
+        'B': {0: 1, 1: 0, 2: 0, 3: 0},
     }
 
 
@@ -74,20 +134,32 @@ def test_synthesize_centers_from_assignments_empty_input_returns_empty_list() ->
     assert synthesize_centers_from_assignments({}) == []
 
 
-def _write_final_csv(results_dir: Path, year: int, rows: list[dict[str, str]]) -> Path:
-    path = results_dir / f'assignments_{year}_final.csv'
+def test_normalize_run_version_label_accepts_digit_and_prefix_forms() -> None:
+    assert normalize_run_version_label('v1') == 'v1'
+    assert normalize_run_version_label('1') == 'v1'
+    assert normalize_run_version_label('01') == 'v1'
+    assert normalize_run_version_label('V12') == 'v12'
+
+
+def test_normalize_run_version_label_rejects_garbage() -> None:
+    with pytest.raises(ValueError):
+        normalize_run_version_label('')
+    with pytest.raises(ValueError):
+        normalize_run_version_label('snap')
+
+
+def _write_assignments_csv(path: Path, rows: list[dict[str, str]]) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
     pl.DataFrame(rows).write_csv(path)
     return path
 
 
-def test_load_existing_assignments_loads_when_centers_empty(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_load_assignments_from_csv_loads_when_centers_empty(
+    tmp_path: Path,
 ) -> None:
-    """With no crews scaffold, the finalized CSV alone drives placements."""
-    monkeypatch.setattr(main_mod, 'RESULTS_DIR', tmp_path)
-    _write_final_csv(
-        tmp_path,
-        2099,
+    """With no crews scaffold, the workbook alone drives placements."""
+    csv_path = _write_assignments_csv(
+        tmp_path / 'assignments_2099.csv',
         [
             {'Center': '1', 'Crew': '101', 'Name': 'Anna', 'Role': 'Youth'},
             {'Center': '1', 'Crew': '102', 'Name': 'Bob', 'Role': 'Youth'},
@@ -101,7 +173,7 @@ def test_load_existing_assignments_loads_when_centers_empty(
         Youth(name='Cara', year='Jr', gender='F', history='V'),
     ]
 
-    assigned = load_existing_assignments(2099, youth_list, centers=[])
+    assigned = load_assignments_from_csv(csv_path, youth_list, centers=[])
 
     assert assigned == {
         ('Anna', '1', '101'): 1,
@@ -110,14 +182,12 @@ def test_load_existing_assignments_loads_when_centers_empty(
     }
 
 
-def test_load_existing_assignments_filters_to_scaffold_when_present(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_load_assignments_from_csv_filters_to_scaffold_when_present(
+    tmp_path: Path,
 ) -> None:
-    """A non-empty crews scaffold acts as a typo guard against the finalized CSV."""
-    monkeypatch.setattr(main_mod, 'RESULTS_DIR', tmp_path)
-    _write_final_csv(
-        tmp_path,
-        2099,
+    """A non-empty crews scaffold acts as a typo guard against the workbook."""
+    csv_path = _write_assignments_csv(
+        tmp_path / 'some.csv',
         [
             {'Center': '1', 'Crew': '101', 'Name': 'Anna', 'Role': 'Youth'},
             {'Center': '1', 'Crew': '999', 'Name': 'Bob', 'Role': 'Youth'},
@@ -129,9 +199,29 @@ def test_load_existing_assignments_filters_to_scaffold_when_present(
         Youth(name='Bob', year='So', gender='M', history='V'),
     ]
 
-    assigned = load_existing_assignments(2099, youth_list, centers)
+    assigned = load_assignments_from_csv(csv_path, youth_list, centers)
 
     assert assigned == {('Anna', '1', '101'): 1}
+
+
+def test_allocate_next_versioned_run_dir_starts_at_v1_and_increments(tmp_path: Path) -> None:
+    d1 = allocate_next_versioned_run_dir(tmp_path, 2026)
+    assert d1 == tmp_path / '2026' / 'v1'
+    assert d1.is_dir()
+
+    d2 = allocate_next_versioned_run_dir(tmp_path, 2026)
+    assert d2 == tmp_path / '2026' / 'v2'
+
+
+def test_allocate_next_versioned_run_dir_only_considers_matching_vdirs(tmp_path: Path) -> None:
+    """Unrelated dirs under ``<year>/`` do not affect the allocated version suffix."""
+    (tmp_path / '2026').mkdir(parents=True)
+    (tmp_path / '2026' / 'draft').mkdir()
+    (tmp_path / '2026' / 'v2').mkdir()
+    (tmp_path / '2026' / 'v3').mkdir()
+
+    d = allocate_next_versioned_run_dir(tmp_path, 2026)
+    assert d == tmp_path / '2026' / 'v4'
 
 
 def test_analyze_clusters_handles_empty_centers(tmp_path: Path) -> None:

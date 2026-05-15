@@ -70,8 +70,8 @@ def synthesize_centers_from_assignments(
 
     Used by the ``--no-reassignment`` analysis path when the crews-CSV scaffold is
     absent (e.g. every leader is ``CENTER_ONLY`` so :func:`get_centers_from_adults_df`
-    returns ``[]``) but ``assignments_{year}_final.csv`` holds the finalized
-    placements. The returned crews carry no leaders; only ``center.name`` and
+    returns ``[]``) but a saved assignments workbook supplies the placements.
+    The returned crews carry no leaders; only ``center.name`` and
     ``crew.name`` strings are needed for downstream reporting and clustering.
     """
     by_center: dict[str, set[str]] = defaultdict(set)
@@ -230,6 +230,45 @@ def calculate_friend_choice_stats(
         'third_choice_pct': round(counts['third_choice'] / total * 100, 1),
         'multiple_friends_pct': round(counts['multiple'] / total * 100, 1),
     }
+
+
+BUDDY_MATCH_BUCKETS: tuple[int, ...] = (0, 1, 2, 3)
+
+
+def calculate_friend_match_buckets(
+    solver: SolverLike,
+    person_crew: PersonCrew,
+    youth_list: list[Youth],
+    centers: list[Center],
+) -> dict[str, dict[int, int]]:
+    """Per-center distribution of how many friend picks land at each youth's center.
+
+    Returns ``{center_name: {0: n, 1: n, 2: n, 3: n}}`` — the count of youth at
+    that center whose 0/1/2/3 same-center buddy matches sum to that bucket. Only
+    roster-youth picks count (leader picks are ignored, matching
+    :func:`calculate_friend_choice_stats`). Youth without an assigned center are
+    skipped, so summed bucket counts equal the placed-youth headcount.
+    """
+    result: dict[str, dict[int, int]] = {
+        c.name: dict.fromkeys(BUDDY_MATCH_BUCKETS, 0) for c in centers
+    }
+    if not youth_list or not centers:
+        return result
+
+    name_to_center = build_name_to_center(solver, person_crew, centers)
+    youth_dict = {y.name: y for y in youth_list}
+
+    for youth in youth_list:
+        my_center = name_to_center.get(youth.name)
+        if my_center is None or my_center not in result:
+            continue
+        matches = 0
+        for choice_attr, _weight in _CHOICES_AND_WEIGHTS:
+            friend = getattr(youth, choice_attr)
+            if friend and friend in youth_dict and name_to_center.get(friend) == my_center:
+                matches += 1
+        result[my_center][matches] += 1
+    return result
 
 
 def print_crew_assignments(

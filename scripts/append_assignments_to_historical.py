@@ -14,8 +14,9 @@ from src.historical import append_assignments_final_to_historical
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
-            "Read data/results/assignments_{year}_final.csv and merge into "
-            "data/clean/historical_crews.csv (same layout as crew CSV merges)."
+            "Read the default data/results/<year>/vN/assignments_{year}.csv "
+            "(v1 except 2025 → v2) and merge into data/clean/historical_crews.csv "
+            "(same layout as crew CSV merges). Override with --assignments."
         )
     )
     parser.add_argument("--year", type=int, required=True, help="Trip year (e.g. 2025)")
@@ -23,7 +24,7 @@ def main() -> None:
         "--assignments",
         type=Path,
         default=None,
-        help="Optional path to assignments CSV (default: data/results/assignments_{year}_final.csv)",
+        help="Optional path to assignments CSV (default: data/results/<year>/v1/..., 2025 uses v2/)",
     )
     parser.add_argument(
         "--historical",

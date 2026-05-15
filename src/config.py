@@ -5,6 +5,7 @@ from typing import Self
 @dataclass
 class CenterConfig:
     """Configuration for a center's crew setup."""
+
     name: str
     crew_count: int | None = None  # None = extract from CSV
 
@@ -34,6 +35,12 @@ class Config:
     history_weight: int = 1  # Weight for youth vet/new diversity
     adult_gender_weight: int = 1  # Weight for adult-leader M/F balance per crew
     adult_history_weight: int = 1  # Weight for adult-leader vet/new balance per crew
+    # Center-level proportional balance (absolute deviation penalties; see objectives module).
+    center_gender_weight: int = 1
+    center_year_weight: int = 1
+    center_history_weight: int = 1
+    # Scales friend + crew-/adult-objective terms vs center proportional penalties only; printed friend scores unchanged.
+    center_balance_softness: int = 4
     # Same-center buddy preference toward an Adult/Young Adult on crews CSV (None mirrors friend_weight).
     adult_friend_weight: int | None = None
 
@@ -46,6 +53,8 @@ class Config:
     def __post_init__(self) -> None:
         if self.adult_friend_weight is None:
             self.adult_friend_weight = self.friend_weight
+        if self.center_balance_softness < 1:
+            raise ValueError(f'center_balance_softness must be >= 1, got {self.center_balance_softness}')
 
     @classmethod
     def default(cls) -> Self:
@@ -72,6 +81,9 @@ class Config:
             gender_weight=2,
             year_weight=2,
             history_weight=2,
+            center_gender_weight=2,
+            center_year_weight=2,
+            center_history_weight=2,
             adult_gender_weight=2,
             adult_history_weight=2,
         )

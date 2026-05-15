@@ -19,6 +19,7 @@ The system takes youth preferences (buddy forms) and assigns each youth to a cre
 - Gender diversity within crews (youth)
 - Year diversity within crews
 - Veteran/New youth balance within crews
+- Gender, year, and veteran/new balance across centers vs a proportional-by-crew-count target (`center_*_weight` knobs)
 - Adult-leader gender and veteran/new balance on each crew (when leader metadata is present)
 
 ## Constraints
@@ -71,11 +72,16 @@ The system optimizes multiple objectives with configurable weights:
    - Rewards crews that have a mix of veteran and new youth
    - Uses minimum of vet/new count as the score
 
-5. **Adult Leader Gender Balance** (`adult_gender_weight`, default=1)
+5. **Center-level youth proportional balance** — separate weights per dimension (`center_gender_weight`, `center_year_weight`, `center_history_weight`, each default **1**)
+   - Goals: keep each demographic bucket roughly proportional to fleet-wide fractions *per crew share* across centers — e.g. avoid one center accumulating most freshmen or males while others do not (soft objective, not a hard cap).
+   - For each demographic value (e.g. `M` / `F`, each year `Fr..Sr`, `V` / `N`), the fleet count is split into integer **targets** per center using **largest-remainder apportionment** by crew counts so targets sum to the fleet bucket total.
+   - The objective penalizes **`weight × (4 / bucket_count) × deviation`** summed over centers and buckets, where `deviation` is absolute error vs that target (`bucket_count` is 2 for gender/history, 4 for year so the knobs are comparable). Penalties subtract from `Maximize` (the solver minimizes total deviation weighted this way). Defaults intentionally act as a **subtle** tie-break vs crew-level diversity — raise each `center_*_weight` to 2–3 when you want a stronger proportional pull across centers.
+
+6. **Adult Leader Gender Balance** (`adult_gender_weight`, default=1)
    - Rewards balanced male/female leadership on each crew when the crews CSV supplies a `gender` value for the leaders placed on that crew
    - Missing gender metadata is skipped so legacy CSVs still solve
 
-6. **Adult Leader Veteran/New Balance** (`adult_history_weight`, default=1)
+7. **Adult Leader Veteran/New Balance** (`adult_history_weight`, default=1)
    - Rewards mixing veteran and new adults on a crew when the crews CSV supplies a `V`/`N` `history` value
    - Missing history metadata is skipped
 
@@ -203,14 +209,18 @@ Jane Doe,K02 2023,False
 
 ## Output
 
-The optimizer writes:
+Each successful **solver run** allocates the next unused version folder under **`data/results/<YEAR>/`**: `v1`, `v2`, … (existing `v*` directories bump the counter so runs do not overwrite each other).
 
-- **`data/results/assignments_{YEAR}.csv`** — solver output with columns: `Center`, `Crew`, `Name`, `Role`, `Gender`, `Year`, `History` (adult rows echo leader metadata when known)
+Under that folder, `main.py` writes:
 
-For workflows that need a frozen roster (re-analysis, publishing, or updating history), maintain a finalized copy as **`data/results/assignments_{YEAR}_final.csv`**. That file is used by:
+- **`assignments_{YEAR}.csv`** — roster with columns: `Center`, `Crew`, `Name`, `Role`, `Gender`, `Year`, `History` (adult rows echo leader metadata when known)
+- **`center_dashboard_{YEAR}.png`** — dashboard figure (every successful solve)
 
-- **`--no-reassignment`** in `main.py` (print metrics and cluster analysis without re-solving)
-- **`scripts/append_assignments_to_historical.py`** (merge the year into `historical_crews.csv`)
+With **`--analyze-clusters`**, it also writes **`cluster_analysis_{YEAR}.png`** in the same version folder.
+
+**Re-analysis (`--no-reassignment`)** reads **`data/results/<YEAR>/<version>/assignments_{YEAR}.csv`** (see [Usage](#usage)) and regenerates dashboard and cluster visuals there.
+
+The history merge script defaults to the same versioned layout (see `scripts/append_assignments_to_historical.py` and `src.historical.default_versioned_assignments_path`).
 
 Console output still includes center/crew breakdowns, diversity and friend-fulfillment summaries, and friend scores.
 
@@ -223,7 +233,7 @@ python scripts/append_assignments_to_historical.py --year Y
 # Optional: --assignments path/to/file.csv --historical path/to/historical_crews.csv --dry-run
 ```
 
-This appends de-duplicated rows to `data/clean/historical_crews.csv` in the same shape as the existing file.
+By default the script reads **`data/results/<YEAR>/v1/assignments_<YEAR>.csv`** (year **2025** uses **`v2`** unless you override with **`--assignments`**). This appends de-duplicated rows to `data/clean/historical_crews.csv` in the same shape as the existing file.
 
 ## Configuration
 
@@ -236,6 +246,7 @@ Adjustable parameters in the `Config` class (`src/config.py`):
 - `gender_weight` — youth gender diversity (default 1)
 - `year_weight` — youth year diversity (default 1)
 - `history_weight` — youth veteran/new mix (default 1)
+- `center_gender_weight` / `center_year_weight` / `center_history_weight` — center-vs-fleet proportional balance penalties for youth gender, year, and history (default 1 each; see Optimization Objectives §5)
 - `adult_gender_weight` — adult leader gender balance (default 1)
 - `adult_history_weight` — adult leader veteran/new balance (default 1)
 - `solver_max_time_seconds` / `solver_num_workers` / `solver_relative_gap_limit` / `solver_log_progress` — CP-SAT runtime knobs
@@ -248,10 +259,16 @@ Factory helpers:
 
 ## Usage
 
+### Versioned results and `--version`
+
+- **Normal solve:** outputs go to **`data/results/<year>/vN/`** with the next free `N` (`v1`, `v2`, …). Do not pass **`--version`** here; the CLI rejects it without **`--no-reassignment`**.
+- **Re-analysis:** **`--no-reassignment`** requires **`--version`** to pick the run folder. Accepts e.g. **`v1`**, **`1`**, or **`V2`** (normalized to `v1`, `v2`, …). It loads **`data/results/<year>/<version>/assignments_<year>.csv`**, prints assignments, and regenerates the dashboard and cluster plots in that same folder.
+
 ### Basic usage
 
 ```bash
 # Run with default settings (centers and crews extracted from adults CSV)
+# Artifacts land under data/results/2026/vN/ (next unused vN)
 python main.py -y 2026
 
 # Specify centers with crew counts
@@ -263,25 +280,26 @@ python main.py -y 2026 --centers Fayette Kanawha Nicholas Leslie
 # Mixed: some with counts, some from CSV
 python main.py -y 2026 --centers Fayette:11 Kanawha Nicholas:11 Leslie
 
-# Analyze an existing finalized roster (no solver): requires data/results/assignments_{year}_final.csv
-python main.py -y 2026 --no-reassignment
+# Re-score an existing run (no solver): --version selects data/results/<year>/vN/
+python main.py -y 2026 --no-reassignment --version v1
+python main.py -y 2026 --no-reassignment --version 2   # same as --version v2
 
-# With cluster analysis (after a full solve, or included automatically with --no-reassignment)
-python main.py -y 2026 --analyze-clusters
-
-# Full example
+# One sweep after a full solve: dashboard always; clusters when flag is set
 python main.py -y 2026 --centers Fayette:11 Kanawha:12 --analyze-clusters
+
+# Rebuild dashboard + cluster PNGs for a locked v1 run only
+python main.py -y 2026 --no-reassignment --version v1
 ```
 
 ### Cluster analysis
 
-The `--analyze-clusters` flag (on a full solve) enables friend cluster detection and visualization:
+On a **full solve**, **`--analyze-clusters`** enables friend cluster detection and visualization:
 
 - Detects friend communities using the Louvain method
 - Evaluates how clusters were split across centers given the assignments
-- Writes `data/results/cluster_analysis_{YEAR}.png` (and related outputs in `data/results/`)
+- Writes **`cluster_analysis_{YEAR}.png`** under **`data/results/<YEAR>/vN/`** for that run
 
-With **`--no-reassignment`**, cluster analysis always runs against the finalized CSV.
+With **`--no-reassignment`**, cluster analysis always runs (no extra flag) using the CSV in the **`--version`** folder.
 
 ## Feature summary
 
@@ -293,4 +311,4 @@ With **`--no-reassignment`**, cluster analysis always runs against the finalized
 - **Anti-buddy lists** — Keep named youth at different centers
 - **Validation & normalization** — `validate_clean_data` and `crew_csv_normalize` for repeatable data prep
 - **History merge script** — Append finalized assignments into `historical_crews.csv`
-- **Re-analysis mode** — `--no-reassignment` for reporting on a locked roster
+- **Versioned runs** — each solve writes under `data/results/<year>/vN/`; `--no-reassignment --version vN` re-reads that folder and refreshes dashboard and cluster outputs

@@ -3,8 +3,12 @@
 Two paths:
 
 1. ``python main.py -y 2026`` — build the CP-SAT model and solve.
-2. ``python main.py -y 2026 --no-reassignment`` — skip the solver and re-score
-   an existing ``data/results/assignments_<year>_final.csv`` for analysis.
+2. ``python main.py -y 2026 --no-reassignment --version v1`` — skip the solver
+   and re-score ``data/results/<year>/vN/assignments_<year>.csv`` for dashboard /
+   cluster output (PNG exports are regenerated in that same ``vN`` folder).
+
+Fresh solver writes land under ``data/results/<year>/vN`` with the next unused
+integer ``N`` (``v1``, ``v2``, …).
 
 The re-analysis path uses a plain ``dict[(name, center, crew), int]`` rather
 than a ``CpSolver``; downstream analysis / writer / clustering helpers accept
@@ -12,6 +16,7 @@ either via a thin :class:`AssignmentsLookup` wrapper.
 """
 
 import argparse
+import re
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -21,6 +26,7 @@ from ortools.sat.python import cp_model
 from src.analysis import (
     PersonCrew,
     SolverLike,
+    calculate_friend_match_buckets,
     calculate_friend_scores,
     print_crew_assignments,
     status_to_string,
@@ -28,6 +34,7 @@ from src.analysis import (
 )
 from src.clustering import analyze_clusters
 from src.config import CenterConfig, Config
+from src.dashboard import render_center_dashboard
 from src.data_loaders import (
     all_friends_are_valid,
     all_parents_are_valid,
@@ -41,6 +48,48 @@ from src.writer import write_results_to_csv
 
 CLEAN_DATA_DIR: Path = Path('./data/clean')
 RESULTS_DIR: Path = Path('./data/results')
+
+
+def normalize_run_version_label(version_arg: str) -> str:
+    """Normalize CLI ``version`` into a directory basename ``v1``, ``v2``, …
+
+    Accepts ``1`` or ``01`` → ``v1``, and ``v2`` / ``V2`` → ``v2``.
+    """
+    raw = version_arg.strip()
+    if not raw:
+        raise ValueError('Version label cannot be empty.')
+    m_digit = re.fullmatch(r'(\d+)', raw)
+    if m_digit:
+        return f'v{int(m_digit.group(1), 10)}'
+    m_v = re.fullmatch(r'[vV](\d+)', raw)
+    if m_v:
+        return f'v{int(m_v.group(1), 10)}'
+    raise ValueError(
+        f'Invalid version {version_arg!r}; expected e.g. v1 or 1.'
+    )
+
+
+def allocate_next_versioned_run_dir(results_base: Path, year: int) -> Path:
+    """Create and return ``results_base / <year> / vN`` with the smallest unused ``N``, starting at 1 (``v1``, ``v2``, …).
+
+    Existing sibling directories whose names match ``v`` + digits (e.g. ``v12``)
+    bump the allocated version so repeated runs never overwrite prior outputs.
+    """
+    year_dir = results_base / str(year)
+    year_dir.mkdir(parents=True, exist_ok=True)
+
+    highest = 0
+    for entry in year_dir.iterdir():
+        if not entry.is_dir():
+            continue
+        m = re.fullmatch(r'v(\d+)', entry.name, flags=re.ASCII)
+        if not m:
+            continue
+        highest = max(highest, int(m.group(1)))
+
+    run_dir = year_dir / f'v{highest + 1}'
+    run_dir.mkdir(parents=False)
+    return run_dir
 
 
 class AssignmentsLookup:
@@ -59,26 +108,25 @@ class AssignmentsLookup:
         return var
 
 
-def load_existing_assignments(
-    year: int,
+def load_assignments_from_csv(
+    assignments_csv: Path,
     youth_list: list[Youth],
     centers: list[Center],
 ) -> dict[tuple[str, str, str], int]:
-    """Load `assignments_{year}_final.csv` into a sparse `(name, center, crew) -> 1` dict.
+    """Load a saved assignments workbook into a sparse ``(name, center, crew) -> 1`` dict.
 
-    The finalized CSV is the source of truth for youth placements. When the
-    crews scaffold (``centers``) is non-empty its ``(Center, Crew)`` pairs are
-    used as a typo guard against the modeled topology; an empty scaffold (e.g.
+    When the crews scaffold (``centers``) is non-empty, its ``(Center, Crew)``
+    pairs are used as a typo guard against stray rows; an empty scaffold (e.g.
     all leaders are ``CENTER_ONLY`` so :func:`get_centers_from_adults_df`
-    returns ``[]``) skips that gate so the finalized roster still loads.
+    returns ``[]``) skips that gate so placements still load.
     """
-    final_path = RESULTS_DIR / f'assignments_{year}_final.csv'
-    if not final_path.is_file():
+    if not assignments_csv.is_file():
         raise FileNotFoundError(
-            f'Required finalized assignments file not found: {final_path}. '
-            'Run a full solve first or copy a finalized roster to that path.'
+            f'Assignments CSV not found: {assignments_csv}. '
+            'Solve first to populate data/results/<year>/vN/assignments_<year>.csv, '
+            'or pass matching --year and --no-reassignment --version vN.'
         )
-    assignments_df = pl.read_csv(final_path).with_columns(
+    assignments_df = pl.read_csv(assignments_csv).with_columns(
         pl.col('Center').cast(pl.Utf8, strict=False),
         pl.col('Crew').cast(pl.Utf8, strict=False),
     )
@@ -111,24 +159,48 @@ def _print_friend_scores(
     print(f'Average score: {avg_score}')
 
 
-def analyze_existing_assignments(year: int, youth_list: list[Youth], centers: list[Center]) -> None:
-    """Re-score existing assignments without re-solving."""
+def analyze_existing_assignments(
+    year: int,
+    youth_list: list[Youth],
+    centers: list[Center],
+    *,
+    version_label: str,
+    results_root: Path = RESULTS_DIR,
+) -> None:
+    """Re-score placements from ``results/<year>/<version>/assignments_<year>.csv`` without solving."""
     print('\n' + '=' * 50)
     print('ANALYZING EXISTING ASSIGNMENTS (--no-reassignment)')
     print('=' * 50)
 
-    person_crew = load_existing_assignments(year, youth_list, centers)
+    run_root = results_root / str(year) / version_label
+    assignments_csv = run_root / f'assignments_{year}.csv'
+    print(f'Source CSV: {assignments_csv}')
+
+    person_crew = load_assignments_from_csv(assignments_csv, youth_list, centers)
     solver = AssignmentsLookup()
 
     effective_centers = centers if centers else synthesize_centers_from_assignments(person_crew)
     if not centers:
         synthesized = [(c.name, [crew.name for crew in c.crews]) for c in effective_centers]
-        print(f'Centers (synthesized from finalized assignments): {synthesized}')
+        print(f'Centers (synthesized from assignments workbook): {synthesized}')
 
     print_crew_assignments(solver, person_crew, youth_list, effective_centers)
 
+    center_friend_scores, _ = calculate_friend_scores(solver, person_crew, youth_list, effective_centers)
+    buddy_match_counts = calculate_friend_match_buckets(solver, person_crew, youth_list, effective_centers)
+
+    print(f'\nRegenerating dashboard and cluster visuals under {run_root}')
+
+    render_center_dashboard(
+        assignments_csv=assignments_csv,
+        output_path=run_root / f'center_dashboard_{year}.png',
+        year=year,
+        friend_scores=center_friend_scores,
+        buddy_match_counts=buddy_match_counts,
+    )
+
     regular_youth = [y for y in youth_list if y.role == 'Youth']
-    analyze_clusters(regular_youth, solver, person_crew, effective_centers, year=year, output_dir=str(RESULTS_DIR))
+    analyze_clusters(regular_youth, solver, person_crew, effective_centers, year=year, output_dir=str(run_root))
 
     _print_friend_scores(solver, person_crew, youth_list, effective_centers)
 
@@ -168,6 +240,9 @@ def run_optimization(
         return
 
     print(f'Solution found! Status: {status_to_string(status)}')
+    run_dir = allocate_next_versioned_run_dir(RESULTS_DIR, year)
+    print(f'\nWriting run artifacts under {run_dir}')
+
     print_crew_assignments(
         solver,
         person_crew,
@@ -186,13 +261,31 @@ def run_optimization(
         adult_crew=adult_crew,
         unassigned_adults=unassigned_adults,
         center_only_adults=center_only_adults,
+        assignments_csv_path=run_dir / f'assignments_{year}.csv',
+    )
+
+    center_friend_scores, _ = calculate_friend_scores(solver, person_crew, youth_list, centers)
+    buddy_match_counts = calculate_friend_match_buckets(solver, person_crew, youth_list, centers)
+    render_center_dashboard(
+        assignments_csv=run_dir / f'assignments_{year}.csv',
+        output_path=run_dir / f'center_dashboard_{year}.png',
+        year=year,
+        friend_scores=center_friend_scores,
+        buddy_match_counts=buddy_match_counts,
     )
 
     if analyze_clusters_flag:
         regular_youth = [y for y in youth_list if y.role == 'Youth']
-        analyze_clusters(regular_youth, solver, person_crew, centers, year=year, output_dir=str(RESULTS_DIR))
+        analyze_clusters(regular_youth, solver, person_crew, centers, year=year, output_dir=str(run_dir))
 
     _print_friend_scores(solver, person_crew, youth_list, centers)
+
+
+def _parse_cli_run_version(version_raw: str) -> str:
+    try:
+        return normalize_run_version_label(version_raw)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(str(e)) from e
 
 
 def main() -> None:
@@ -202,13 +295,37 @@ def main() -> None:
         '--centers', nargs='*', help='Center specifications in format "CenterName:CrewCount" or "CenterName" (e.g., Fayette:11 Kanawha:12)'
     )
     parser.add_argument('--analyze-clusters', action='store_true', help='Run friend cluster analysis and generate visualization')
-    parser.add_argument('--no-reassignment', action='store_true', help='Skip optimization and analyze existing assignments from CSV')
+    parser.add_argument(
+        '--no-reassignment',
+        action='store_true',
+        help=(
+            'Skip optimization; read data/results/<year>/<version>/assignments_<year>.csv '
+            'and regenerate dashboard + cluster visuals in that folder (requires --version).'
+        ),
+    )
+    parser.add_argument(
+        '--version',
+        metavar='VN',
+        default=None,
+        type=_parse_cli_run_version,
+        help=(
+            'With --no-reassignment: subdirectory under data/results/<year>/, e.g. v1 or 2 (required there). '
+            'Ignored during a normal solver run.'
+        ),
+    )
+
     args = parser.parse_args()
 
     year = args.year
     center_specs = args.centers
     analyze_clusters_flag = args.analyze_clusters
     no_reassignment = args.no_reassignment
+
+    if args.version is not None and not no_reassignment:
+        parser.error('--version is only used with --no-reassignment.')
+
+    if no_reassignment and args.version is None:
+        parser.error('--no-reassignment requires --version (e.g. --version v1).')
 
     center_configs = None
     if center_specs:
@@ -255,7 +372,9 @@ def main() -> None:
         print(f'Unassigned leaders (algorithm assigns center & crew): {len(unassigned_adults)}')
 
     if no_reassignment:
-        analyze_existing_assignments(year, youth_list, centers)
+        retro_label = args.version
+        assert retro_label is not None
+        analyze_existing_assignments(year, youth_list, centers, version_label=retro_label)
     else:
         run_optimization(
             year, youth_list, centers, center_only_adults, unassigned_adults,

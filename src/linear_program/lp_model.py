@@ -17,6 +17,7 @@ unchanged); no helper needs to know about siblings of its parameters.
 """
 
 from collections.abc import Sequence
+from typing import cast
 
 from ortools.sat.python import cp_model
 
@@ -49,6 +50,9 @@ from src.linear_program.objectives import (
     ObjectiveTerm,
     add_adult_leader_gender_objectives,
     add_adult_leader_history_objectives,
+    add_center_gender_diversity_objectives,
+    add_center_history_diversity_objectives,
+    add_center_year_diversity_objectives,
     add_friend_preference_objectives,
     add_gender_diversity_objectives,
     add_history_diversity_objectives,
@@ -333,7 +337,8 @@ def create_crew_assignment_model(
     enforce_new_requires_vet(ctx)
     break_symmetry_unassigned_adults(ctx)
 
-    objective_terms: list[ObjectiveTerm] = [
+    softness = cfg.center_balance_softness
+    non_center_terms: list[ObjectiveTerm] = [
         *add_friend_preference_objectives(ctx),
         *add_gender_diversity_objectives(ctx),
         *add_year_diversity_objectives(ctx),
@@ -341,6 +346,13 @@ def create_crew_assignment_model(
         *add_adult_leader_gender_objectives(ctx),
         *add_adult_leader_history_objectives(ctx),
     ]
+    center_terms: list[ObjectiveTerm] = [
+        *add_center_gender_diversity_objectives(ctx),
+        *add_center_year_diversity_objectives(ctx),
+        *add_center_history_diversity_objectives(ctx),
+    ]
+    scaled_non_center = [cast(ObjectiveTerm, softness * term) for term in non_center_terms]
+    objective_terms: list[ObjectiveTerm] = [*scaled_non_center, *center_terms]
 
     model.Maximize(sum(objective_terms))
 

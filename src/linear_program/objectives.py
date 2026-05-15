@@ -9,6 +9,7 @@ sparse ``person_crew`` dict on ``ctx``. ``person_crew.get(key, 0)`` is the
 safe lookup.
 """
 
+from collections.abc import Sequence
 from typing import Final, cast
 
 from ortools.sat.python import cp_model
@@ -21,6 +22,30 @@ from src.models import Youth
 ObjectiveTerm = cp_model.LinearExpr | int
 
 YEARS: Final[tuple[str, ...]] = ('Fr', 'So', 'Jr', 'Sr')
+
+# lcm(2, 4): scale per-(center, bucket) deviation so gender/history and year knobs match.
+CENTER_DIVERSITY_BUCKET_NORM: Final[int] = 4
+
+
+def proportional_integer_targets(bucket_total: int, center_crew_counts: Sequence[int]) -> list[int]:
+    """Split ``bucket_total`` across centers proportional to crew counts.
+
+    Uses largest remainder (Hamilton) so targets are integers summing exactly to ``bucket_total``.
+    """
+    n_centers = len(center_crew_counts)
+    total_crews = sum(center_crew_counts)
+    if n_centers == 0:
+        return []
+    if bucket_total <= 0 or total_crews == 0:
+        return [0] * n_centers
+
+    floors: list[int] = [(bucket_total * crews) // total_crews for crews in center_crew_counts]
+    remainder = bucket_total - sum(floors)
+    # Highest remainder `(bucket_total * crews_i) mod total_crews` receives +1 slots first.
+    order = sorted(range(n_centers), key=lambda i: (bucket_total * center_crew_counts[i]) % total_crews, reverse=True)
+    for i in order[:remainder]:
+        floors[i] += 1
+    return floors
 
 
 def _is_zero(value: cp_model.LinearExpr | int) -> bool:
@@ -124,8 +149,7 @@ def _crew_attribute_sum(
     terms = [
         person_crew[(y.name, center_name, crew_name)]
         for y in youth_list
-        if getattr(y, attribute) == value
-        and (y.name, center_name, crew_name) in person_crew
+        if getattr(y, attribute) == value and (y.name, center_name, crew_name) in person_crew
     ]
     if not terms:
         return 0
@@ -191,6 +215,105 @@ def add_history_diversity_objectives(ctx: ModelContext) -> list[ObjectiveTerm]:
     return objective_terms
 
 
+def _center_bucket_sum(
+    ctx: ModelContext,
+    *,
+    attribute: str,
+    value: str,
+    center_name: str,
+) -> cp_model.LinearExpr | int:
+    """Count regular youth at ``center_name`` with ``attribute == value``."""
+    terms: list[cp_model.LinearExpr | int] = [ctx.at_center[(y.name, center_name)] for y in ctx.regular_youth if getattr(y, attribute) == value]
+    if not terms:
+        return 0
+    if len(terms) == 1:
+        return terms[0]
+    return cast(cp_model.LinearExpr, sum(terms))
+
+
+def _add_center_proportional_balance_terms(
+    ctx: ModelContext,
+    *,
+    attribute: str,
+    values: tuple[str, ...],
+    weight: int,
+    var_prefix: str,
+) -> list[ObjectiveTerm]:
+    """Penalize absolute deviation from crew-proportional targets per center and demographic bucket."""
+    if weight <= 0:
+        return []
+
+    centers = ctx.centers
+    bucket_norm = CENTER_DIVERSITY_BUCKET_NORM // len(values)
+    if CENTER_DIVERSITY_BUCKET_NORM % len(values) != 0:
+        raise ValueError(f'CENTER_DIVERSITY_BUCKET_NORM must be divisible by bucket count ({CENTER_DIVERSITY_BUCKET_NORM} % {len(values)} != 0)')
+
+    objective_terms: list[ObjectiveTerm] = []
+    center_crew_counts: list[int] = [len(c.crews) for c in centers]
+
+    for v in values:
+        total_bucket = sum(1 for y in ctx.regular_youth if getattr(y, attribute) == v)
+        if total_bucket == 0:
+            continue
+
+        targets = proportional_integer_targets(total_bucket, center_crew_counts)
+
+        for center, target_v_c in zip(centers, targets, strict=True):
+            base_coef = weight * bucket_norm
+            actual_v_c = _center_bucket_sum(ctx, attribute=attribute, value=v, center_name=center.name)
+            deviation_ub = max(target_v_c, total_bucket - target_v_c)
+
+            if deviation_ub <= 0:
+                continue
+
+            if isinstance(actual_v_c, int):
+                dev_int = abs(actual_v_c - target_v_c)
+                if dev_int <= 0:
+                    continue
+                objective_terms.append(cast(ObjectiveTerm, -base_coef * dev_int))
+                continue
+
+            deviation = ctx.model.NewIntVar(0, deviation_ub, f'{var_prefix}_{center.name}_{v}')
+            delta = cast(cp_model.LinearExpr, actual_v_c - target_v_c)
+            ctx.model.AddAbsEquality(deviation, delta)
+            objective_terms.append(cast(ObjectiveTerm, -base_coef * deviation))
+
+    return objective_terms
+
+
+def add_center_gender_diversity_objectives(ctx: ModelContext) -> list[ObjectiveTerm]:
+    """Penalize youth gender imbalance across centers versus proportional crew share."""
+    return _add_center_proportional_balance_terms(
+        ctx,
+        attribute='gender',
+        values=('M', 'F'),
+        weight=ctx.cfg.center_gender_weight,
+        var_prefix='center_gender_dev',
+    )
+
+
+def add_center_year_diversity_objectives(ctx: ModelContext) -> list[ObjectiveTerm]:
+    """Penalize year-bucket imbalance across centers versus proportional crew share."""
+    return _add_center_proportional_balance_terms(
+        ctx,
+        attribute='year',
+        values=YEARS,
+        weight=ctx.cfg.center_year_weight,
+        var_prefix='center_year_dev',
+    )
+
+
+def add_center_history_diversity_objectives(ctx: ModelContext) -> list[ObjectiveTerm]:
+    """Penalize vet/new imbalance across centers versus proportional crew share."""
+    return _add_center_proportional_balance_terms(
+        ctx,
+        attribute='history',
+        values=('V', 'N'),
+        weight=ctx.cfg.center_history_weight,
+        var_prefix='center_history_dev',
+    )
+
+
 # ----- Adult-side leader balance ----------------------------------------------
 
 
@@ -235,7 +358,9 @@ def add_adult_leader_gender_objectives(ctx: ModelContext) -> list[ObjectiveTerm]
     """Reward crews whose leadership has both M and F representation."""
     return _add_leader_min_balance_terms(
         ctx,
-        attribute='gender', value_a='M', value_b='F',
+        attribute='gender',
+        value_a='M',
+        value_b='F',
         weight=ctx.cfg.adult_gender_weight,
         var_prefix='adult_gender_balance',
         upper_bound=ctx.cfg.max_adults_per_crew,
@@ -246,7 +371,9 @@ def add_adult_leader_history_objectives(ctx: ModelContext) -> list[ObjectiveTerm
     """Reward crews whose leadership has both Vet and New representation."""
     return _add_leader_min_balance_terms(
         ctx,
-        attribute='history', value_a='V', value_b='N',
+        attribute='history',
+        value_a='V',
+        value_b='N',
         weight=ctx.cfg.adult_history_weight,
         var_prefix='adult_history_balance',
         upper_bound=ctx.cfg.max_adults_per_crew,

@@ -1,8 +1,8 @@
-"""Write the solver's assignment output to ``data/results/assignments_<year>.csv``."""
+"""Write the solver's assignment output to a CSV (default: ``data/results/assignments_<year>.csv``)."""
 
-import os
 from collections.abc import Sequence
 from itertools import chain
+from pathlib import Path
 
 import polars as pl
 from ortools.sat.python import cp_model
@@ -32,15 +32,20 @@ def write_results_to_csv(
     adult_crew: dict[tuple[str, str, str], cp_model.IntVar] | None = None,
     unassigned_adults: Sequence[Leader] | None = None,
     center_only_adults: Sequence[Leader] | None = None,
-) -> None:
+    *,
+    assignments_csv_path: Path | None = None,
+) -> Path:
     """Emit one row per (youth or leader, crew) placement.
 
     Pre-assigned leaders come from ``crew.adults`` (typed instances). Flexible
     leaders (Adult / Young Adult, center-only + unassigned) come from the matching
     ``adult_crew`` Boolean — collapsed into one loop using ``itertools.chain``.
+
+    When ``assignments_csv_path`` is omitted, writes ``./data/results/assignments_<year>.csv``.
+    Returns the path written.
     """
-    output_path = f'./data/results/assignments_{year}.csv'
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    output_file = assignments_csv_path or Path('./data/results') / f'assignments_{year}.csv'
+    output_file.parent.mkdir(parents=True, exist_ok=True)
 
     flex_pool: list[Leader] = list(chain(center_only_adults or [], unassigned_adults or []))
     rows: list[dict[str, str]] = []
@@ -72,5 +77,6 @@ def write_results_to_csv(
                         role=leader.role, gender=leader.gender, year='', history=leader.history,
                     ))
 
-    pl.DataFrame(rows).write_csv(output_path)
-    print(f'\nResults written to {output_path}')
+    pl.DataFrame(rows).write_csv(output_file)
+    print(f'\nResults written to {output_file}')
+    return output_file

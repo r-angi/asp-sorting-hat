@@ -1,15 +1,73 @@
 from collections import defaultdict
-from typing import Any
+from pathlib import Path
+from typing import Any, cast
 
 import matplotlib.pyplot as plt
+from matplotlib import colormaps
+from matplotlib.colors import to_rgba
 import networkx as nx  # type: ignore[import-untyped]
 import numpy as np
 from community import community_louvain  # type: ignore
 
-from src.analysis import PersonCrew, SolverLike, is_person_at_center
+from src.analysis import PersonCrew, SolverLike, build_name_to_center, is_person_at_center
 from src.models import Center, Youth
 
 __all__ = ('is_person_at_center', 'analyze_clusters', 'detect_friend_clusters')
+
+
+def _cmap_lut_rgba(cmap_key: str, n_colors: int) -> np.ndarray:
+    """Evenly sample ``n_colors`` RGBA rows from matplotlib's named registry colormap."""
+    if n_colors <= 0:
+        return np.zeros((0, 4), dtype=float)
+    cmap_obj = cast(Any, colormaps[cmap_key])
+    return np.asarray(cmap_obj(np.linspace(0.0, 1.0, n_colors)), dtype=float)
+
+
+# Qualitative hues (Paul Tol–style): strong separation on screen and in print; avoids Set3 pastels.
+_CENTER_QUALITATIVE_HEX: tuple[str, ...] = (
+    '#0077BB',
+    '#EE7733',
+    '#228833',
+    '#CCBB44',
+    '#AA3377',
+    '#66CCEE',
+    '#EE6677',
+    '#009988',
+    '#332288',
+    '#CC6677',
+    '#44AA99',
+    '#882255',
+    '#117733',
+    '#DDCC77',
+    '#6699CC',
+    '#AA4499',
+    '#997700',
+    '#661100',
+)
+
+
+def _center_palette_rgba(n_colors: int) -> np.ndarray:
+    """Distinct RGBA rows for center legends and roster cells (replaces ``Set3`` sampling)."""
+    if n_colors <= 0:
+        return np.zeros((0, 4), dtype=float)
+    if n_colors <= len(_CENTER_QUALITATIVE_HEX):
+        return np.asarray([to_rgba(h) for h in _CENTER_QUALITATIVE_HEX[:n_colors]], dtype=float)
+    base = np.asarray([to_rgba(h) for h in _CENTER_QUALITATIVE_HEX], dtype=float)
+    need_extra = n_colors - len(_CENTER_QUALITATIVE_HEX)
+    tab20 = _cmap_lut_rgba('tab20', 20)
+    order = list(range(0, 20, 2)) + list(range(1, 20, 2))
+    extra = np.asarray([tab20[order[k % len(order)]] for k in range(need_extra)], dtype=float)
+    return np.vstack([base, extra])
+
+
+def _patch_rgba4(patch: Any) -> tuple[float, float, float, float]:
+    """Primary facecolor of a patch as RGBA tuple (floats in [0, 1])."""
+    flat = np.asarray(patch.get_facecolor(), dtype=float).reshape(-1)
+    r = float(flat.flat[0])
+    g = float(flat.flat[1])
+    b = float(flat.flat[2])
+    a = float(flat.flat[3]) if flat.size >= 4 else 1.0
+    return (r, g, b, a)
 
 
 def detect_friend_clusters(youth_list: list[Youth]) -> dict[str, int]:
@@ -116,7 +174,7 @@ def visualize_cluster_distribution(
 
     # Get center names and create color mapping
     center_names = [c.name for c in centers]
-    center_colors = plt.cm.Set3(np.linspace(0, 1, len(center_names)))
+    center_colors = _center_palette_rgba(len(center_names))
     center_color_map = {name: center_colors[i] for i, name in enumerate(center_names)}
 
     # Build mapping of name -> center assignment
@@ -129,8 +187,8 @@ def visualize_cluster_distribution(
 
     # Build cluster members dict for layout calculations
     cluster_members: dict[int, list[str]] = defaultdict(list)
-    for name, cluster_id in clusters.items():
-        cluster_members[cluster_id].append(name)
+    for name, louvain_cluster in clusters.items():
+        cluster_members[louvain_cluster].append(name)
 
     # Calculate dynamic heights based on content
     clusters_per_row = 5
@@ -165,25 +223,25 @@ def visualize_cluster_distribution(
 
     # Create matrix for stacked bar chart
     data_matrix = np.zeros((len(cluster_ids), len(center_names)))
-    for i, cluster_id in enumerate(cluster_ids):
-        center_dist = cohesion_data[cluster_id]['center_distribution']
-        for j, center_name in enumerate(center_names):
-            data_matrix[i, j] = center_dist.get(center_name, 0)
+    for irow, cohesion_k in enumerate(cluster_ids):
+        center_dist = cohesion_data[cohesion_k]['center_distribution']
+        for j, center_nm in enumerate(center_names):
+            data_matrix[irow, j] = center_dist.get(center_nm, 0)
 
     x = np.arange(len(cluster_ids))
     width = 0.8
     bottom = np.zeros(len(cluster_ids))
 
-    for j, center_name in enumerate(center_names):
-        values = data_matrix[:, j]
-        ax_bar.bar(x, values, width, label=center_name, bottom=bottom, color=center_colors[j])
+    for j_c, center_nm in enumerate(center_names):
+        values = data_matrix[:, j_c]
+        ax_bar.bar(x, values, width, label=center_nm, bottom=bottom, color=center_colors[j_c])
         bottom += values
 
     # Add cohesion scores as annotations
-    for i, cluster_id in enumerate(cluster_ids):
-        cohesion = cohesion_data[cluster_id]['cohesion_score']
-        size = cohesion_data[cluster_id]['size']
-        ax_bar.text(i, bottom[i] + 0.5, f'{cohesion:.1%}\n(n={size})', ha='center', va='bottom', fontsize=8)
+    for irow, cohesion_k in enumerate(cluster_ids):
+        cohesion = cohesion_data[cohesion_k]['cohesion_score']
+        size = cohesion_data[cohesion_k]['size']
+        ax_bar.text(irow, bottom[irow] + 0.5, f'{cohesion:.1%}\n(n={size})', ha='center', va='bottom', fontsize=8)
 
     ax_bar.set_xlabel('Friend Cluster', fontsize=12)
     ax_bar.set_ylabel('Number of Youth', fontsize=12)
@@ -287,13 +345,14 @@ def visualize_cluster_distribution(
 
     # Use multiple colormaps to ensure enough distinct colors
     if len(unique_clusters) <= 20:
-        cluster_colors_palette = plt.cm.tab20(np.linspace(0, 1, len(unique_clusters)))
+        cluster_colors_palette = _cmap_lut_rgba('tab20', len(unique_clusters))
     else:
         # Combine tab20 with tab20b and tab20c for more colors
-        colors1 = plt.cm.tab20(np.linspace(0, 1, 20))
-        colors2 = plt.cm.tab20b(np.linspace(0, 1, min(20, len(unique_clusters) - 20)))
+        colors1 = _cmap_lut_rgba('tab20', 20)
+        tail = len(unique_clusters) - 20
+        colors2 = _cmap_lut_rgba('tab20b', min(20, tail))
         if len(unique_clusters) > 40:
-            colors3 = plt.cm.tab20c(np.linspace(0, 1, len(unique_clusters) - 40))
+            colors3 = _cmap_lut_rgba('tab20c', len(unique_clusters) - 40)
             cluster_colors_palette = np.vstack([colors1, colors2, colors3])
         else:
             cluster_colors_palette = np.vstack([colors1, colors2])
@@ -313,16 +372,16 @@ def visualize_cluster_distribution(
 
     y_start = 0.93
     row_start_y = y_start  # Track where each row starts
-    row_min_y = {}  # Track the minimum y for each row (to know where next row should start)
+    row_min_y: dict[int, float] = {}  # Track the minimum y for each row (to know where next row should start)
 
-    for idx, cluster_id in enumerate(cluster_ids):
-        col = idx % clusters_per_row
-        row = idx // clusters_per_row
+    for idx_ck, cohesion_k in enumerate(cluster_ids):
+        col = idx_ck % clusters_per_row
+        row = idx_ck // clusters_per_row
 
         x_base = col * col_width + 0.01
 
-        cluster_label = f'C{idx + 1}'
-        cluster_num = int(cluster_id.split('_')[1])
+        cluster_label = f'C{idx_ck + 1}'
+        cluster_num = int(cohesion_k.split('_')[1])
         members = sorted(cluster_members[cluster_num])
 
         # Calculate y position for this cluster
@@ -349,15 +408,15 @@ def visualize_cluster_distribution(
 
         # Draw each member as a colored box
         for name in members:
-            center = name_to_center.get(name)
-            color = center_color_map.get(center, 'gray') if center else 'gray'
+            assigned_cn = name_to_center.get(name)
+            color_any: Any = center_color_map.get(assigned_cn, 'gray') if assigned_cn else 'gray'
 
             # Draw rectangle
             rect = plt.Rectangle(
                 (x_base, y_current - box_height / 2),
                 box_width,
                 box_height,
-                facecolor=color,
+                facecolor=color_any,
                 edgecolor='black',
                 linewidth=0.5,
                 transform=ax_clusters.transAxes,
@@ -392,7 +451,7 @@ def visualize_cluster_distribution(
     # Draw each center as a column, grouped by cluster
     for center_idx, center_name in enumerate(center_names):
         x_base = center_idx * center_col_width + 0.01
-        names_in_center = [name for name, center in name_to_center.items() if center == center_name]
+        names_in_center = [nm for nm, ctr_nm in name_to_center.items() if ctr_nm == center_name]
 
         # Group names by cluster
         center_clusters: dict[int, list[str]] = defaultdict(list)
@@ -418,27 +477,26 @@ def visualize_cluster_distribution(
         y_current -= 0.025  # Reduced from 0.03
 
         # Draw each cluster group within this center
-        for cluster_id, cluster_names in sorted_clusters:
+        for partition_id, members_of_partition in sorted_clusters:
+            cluster_label_vis: str
             # Get cluster label and color
-            if cluster_id != -1 and cluster_id in cluster_color_map:
-                color = cluster_color_map[cluster_id]
-                # Find cluster display label
-                cluster_label = None
-                for idx, cid in enumerate(cluster_ids):
-                    if int(cid.split('_')[1]) == cluster_id:
-                        cluster_label = f'C{idx + 1}'
+            if partition_id != -1 and partition_id in cluster_color_map:
+                color = cluster_color_map[partition_id]
+                cluster_label_candidate: str | None = None
+                for ck_idx, cohesion_key_ck in enumerate(cluster_ids):
+                    if int(cohesion_key_ck.split('_')[1]) == partition_id:
+                        cluster_label_candidate = f'C{ck_idx + 1}'
                         break
-                if not cluster_label:
-                    cluster_label = 'C?'
+                cluster_label_vis = cluster_label_candidate or 'C?'
             else:
                 color = 'lightgray'
-                cluster_label = 'Other'
+                cluster_label_vis = 'Other'
 
             # Cluster sub-header
             ax_centers.text(
                 x_base + center_box_width / 2,
                 y_current,
-                f'{cluster_label}',
+                cluster_label_vis,
                 fontsize=6,
                 weight='bold',
                 style='italic',
@@ -449,7 +507,7 @@ def visualize_cluster_distribution(
             y_current -= 0.015  # Reduced from 0.018
 
             # Draw each member in this cluster (alphabetically)
-            for name in sorted(cluster_names):
+            for nm in sorted(members_of_partition):
                 # Check if we have enough space (bottom of box should stay above 0.01)
                 if y_current - box_height / 2 < 0.01:
                     print(f'Warning: Ran out of space in {center_name} column. Increase centers_height.')
@@ -472,7 +530,7 @@ def visualize_cluster_distribution(
                 ax_centers.text(
                     x_base + center_box_width / 2,
                     y_current,
-                    name,
+                    nm,
                     fontsize=5,
                     ha='center',
                     va='center',
@@ -484,10 +542,414 @@ def visualize_cluster_distribution(
             # Add small spacing between cluster groups
             y_current -= 0.008
 
-    plt.savefig(output_path, dpi=300, bbox_inches='tight')
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
     plt.close()
 
     print(f'Cluster visualization saved to {output_path}')
+
+
+def _cluster_id_to_palette_map(unique_clusters: list[int]) -> dict[int, Any]:
+    """Map Louvain cluster ids to distinct RGBA colors (same scheme as visualize_cluster_distribution)."""
+    n = len(unique_clusters)
+    if n <= 20:
+        palette = _cmap_lut_rgba('tab20', n)
+    else:
+        colors1 = _cmap_lut_rgba('tab20', 20)
+        tail_len = min(20, n - 20)
+        colors2 = _cmap_lut_rgba('tab20b', tail_len)
+        if n > 40:
+            colors3 = _cmap_lut_rgba('tab20c', n - 40)
+            palette = np.vstack([colors1, colors2, colors3])
+        else:
+            palette = np.vstack([colors1, colors2])
+    return dict(zip(unique_clusters, palette, strict=True))
+
+
+def _cell_text_color(bg: tuple[float, float, float, float]) -> tuple[float, float, float]:
+    """Pick black or white text for contrast against ``bg`` RGBA tuple."""
+    r, g, b = bg[0], bg[1], bg[2]
+    luminance = 0.2126 * r + 0.7152 * g + 0.0722 * b
+    return (0.0, 0.0, 0.0) if luminance > 0.55 else (1.0, 1.0, 1.0)
+
+
+def render_cluster_roster_table(
+    clusters: dict[str, int],
+    cohesion_data: dict[str, dict[str, Any]],
+    centers: list[Center],
+    solver: SolverLike,
+    person_crew: PersonCrew,
+    youth_list: list[Youth],
+    output_path: str = 'cluster_roster.png',
+) -> None:
+    """One row per youth, grouped by friend cluster: name cell = assigned center; cluster id on the left."""
+    if not centers or not youth_list:
+        print(f'Skipping {output_path}: roster table requires at least one center and one youth.')
+        return
+
+    center_names = [c.name for c in centers]
+    center_colors_arr = _center_palette_rgba(len(center_names))
+    center_color_map = {name: center_colors_arr[i] for i, name in enumerate(center_names)}
+    name_to_center_full = build_name_to_center(solver, person_crew, centers)
+
+    cluster_sizes = [(cid, data['size']) for cid, data in cohesion_data.items()]
+    cluster_sizes.sort(key=lambda x: x[1], reverse=True)
+    cluster_ids_ordered = [cid for cid, _ in cluster_sizes]
+
+    cluster_label_by_cohesion: dict[str, int] = {ck: i + 1 for i, ck in enumerate(cluster_ids_ordered)}
+
+    cluster_numeric_by_key: dict[str, int] = {cid: int(cid.split('_')[1]) for cid in cluster_ids_ordered}
+
+    youths_by_numeric: dict[int, list[str]] = defaultdict(list)
+    for nm, nid in clusters.items():
+        youths_by_numeric[nid].append(nm)
+
+    ordered_rows: list[Youth] = []
+    for cohesion_id in cluster_ids_ordered:
+        nid = cluster_numeric_by_key[cohesion_id]
+        for nm in sorted(youths_by_numeric[nid]):
+            y = next((x for x in youth_list if x.name == nm), None)
+            if y is not None:
+                ordered_rows.append(y)
+
+    n_data = len(ordered_rows)
+    row_height = 0.32
+    legend_y0 = (n_data + 1) * row_height
+    total_h = legend_y0 + row_height
+    # CSV-like layout: narrow figure so a row reads in a single horizontal scan,
+    # constant row height in inches so names never overlap regardless of roster size.
+    fig_width = 14.75
+    per_row_in = 0.28
+    fig_height_in = max(6.0, per_row_in * (n_data + 3))
+
+    LABEL_COL_LEFT = -0.52
+    LABEL_COL_RIGHT = 0.0
+    DATA_X1 = 6.0
+
+    fig = plt.figure(figsize=(fig_width, fig_height_in))
+    ax = fig.add_axes((0.04, 0.03, 0.92, 0.93))
+    ax.set_xlim(LABEL_COL_LEFT, DATA_X1)
+    ax.set_ylim(0, total_h)
+    ax.axis('off')
+
+    UNKNOWN_BG = '#D3D3D3'
+    headers = ('Name', 'First Buddy', 'Second Buddy', 'Third Buddy', 'Parent', 'Siblings')
+    header_y0 = (n_data) * row_height
+    fontsize_header = 11
+    fontsize_cell = 8
+
+    def cohesion_key(name: str) -> str | None:
+        nid = clusters.get(name, -1)
+        if nid < 0:
+            return None
+        return f'cluster_{nid}'
+
+    cluster_row_spans: list[tuple[int, int, str | None]] = []
+    if n_data:
+        seg_start = 0
+        prev_ck = cohesion_key(ordered_rows[0].name)
+        for ri in range(1, n_data):
+            ck = cohesion_key(ordered_rows[ri].name)
+            if ck != prev_ck:
+                cluster_row_spans.append((seg_start, ri - 1, prev_ck))
+                seg_start = ri
+                prev_ck = ck
+        cluster_row_spans.append((seg_start, n_data - 1, prev_ck))
+
+    # Center color legend (above column headers)
+    leg_rect = plt.Rectangle(
+        (LABEL_COL_LEFT + 0.02, legend_y0 + 0.02 * row_height),
+        LABEL_COL_RIGHT - LABEL_COL_LEFT - 0.04,
+        row_height * 0.96,
+        facecolor='#F0F0F0',
+        edgecolor='black',
+        linewidth=0.8,
+        clip_on=False,
+    )
+    ax.add_patch(leg_rect)
+    ax.text(
+        (LABEL_COL_LEFT + LABEL_COL_RIGHT) / 2,
+        legend_y0 + row_height / 2,
+        'Centers',
+        ha='center',
+        va='center',
+        fontsize=max(8, fontsize_header - 2),
+        fontweight='bold',
+        clip_on=False,
+    )
+    n_cent = len(center_names)
+    grid_left = LABEL_COL_RIGHT
+    grid_w = DATA_X1 - grid_left
+    if n_cent:
+        slot_w = grid_w / n_cent
+        pad_x = 0.05
+        swatch_w = min(0.12, max(0.06, slot_w * 0.2))
+        swatch_h = row_height * 0.55
+        swatch_y = legend_y0 + row_height * 0.22
+        fontsize_legend = max(6, min(9, int(52 / max(n_cent, 1)) + 3))
+        for i, cnm in enumerate(center_names):
+            x_slot = grid_left + i * slot_w
+            rgba = center_color_map[cnm]
+            sw = plt.Rectangle(
+                (x_slot + pad_x, swatch_y),
+                swatch_w,
+                swatch_h,
+                facecolor=rgba,
+                edgecolor='0.25',
+                linewidth=0.55,
+                clip_on=False,
+                zorder=6,
+            )
+            ax.add_patch(sw)
+            tx = x_slot + pad_x + swatch_w + 0.04
+            ax.text(
+                tx,
+                legend_y0 + row_height / 2,
+                cnm,
+                ha='left',
+                va='center',
+                fontsize=fontsize_legend,
+                color='0.1',
+                clip_on=False,
+                zorder=6,
+            )
+    leg_row_outline = plt.Rectangle(
+        (grid_left, legend_y0),
+        grid_w,
+        row_height,
+        facecolor='none',
+        edgecolor='black',
+        linewidth=0.8,
+        clip_on=False,
+        zorder=5,
+    )
+    ax.add_patch(leg_row_outline)
+
+    # Cluster id column header
+    h_rect = plt.Rectangle(
+        (LABEL_COL_LEFT + 0.02, header_y0 + 0.02 * row_height),
+        LABEL_COL_RIGHT - LABEL_COL_LEFT - 0.04,
+        row_height * 0.96,
+        facecolor='#E8E8E8',
+        edgecolor='black',
+        linewidth=0.8,
+        clip_on=False,
+    )
+    ax.add_patch(h_rect)
+    ax.text(
+        (LABEL_COL_LEFT + LABEL_COL_RIGHT) / 2,
+        header_y0 + row_height / 2,
+        'Cluster',
+        ha='center',
+        va='center',
+        fontsize=max(9, fontsize_header - 2),
+        fontweight='bold',
+        clip_on=False,
+    )
+
+    for col, title in enumerate(headers):
+        bx = col + 0.02
+        bw = 0.96
+        rect = plt.Rectangle(
+            (bx, header_y0 + 0.02 * row_height),
+            bw,
+            row_height * 0.96,
+            facecolor='#E8E8E8',
+            edgecolor='black',
+            linewidth=0.8,
+            transform=None,
+            clip_on=False,
+        )
+        ax.add_patch(rect)
+        ax.text(
+            bx + bw / 2,
+            header_y0 + row_height / 2,
+            title,
+            ha='center',
+            va='center',
+            fontsize=fontsize_header,
+            fontweight='bold',
+            clip_on=False,
+        )
+
+    def draw_colored_stripes(
+        col: int,
+        y_bottom: float,
+        stripe_height: float,
+        names_with_centers: list[tuple[str, str | None]],
+    ) -> None:
+        """Draw vertically stacked stripes in one cell."""
+        bx = col + 0.02
+        bw = 0.96
+        if not names_with_centers:
+            return
+        for si, (label, center_nm) in enumerate(names_with_centers):
+            sty = y_bottom + si * stripe_height
+            face: Any = UNKNOWN_BG
+            if center_nm is not None and center_nm in center_color_map:
+                face = center_color_map[center_nm]
+            stripe_rect = plt.Rectangle(
+                (bx, sty),
+                bw,
+                stripe_height * 0.98,
+                facecolor=face,
+                edgecolor='black',
+                linewidth=0.4,
+                clip_on=False,
+            )
+            ax.add_patch(stripe_rect)
+            tc = _cell_text_color(_patch_rgba4(stripe_rect))
+            ax.text(
+                bx + bw / 2,
+                sty + stripe_height / 2,
+                label,
+                ha='center',
+                va='center',
+                fontsize=fontsize_cell - 1,
+                color=tc,
+                clip_on=False,
+            )
+
+    for ri, youth in enumerate(ordered_rows):
+        y_bottom = (n_data - 1 - ri) * row_height
+        youth_center = name_to_center_full.get(youth.name)
+
+        buddy_triples: list[tuple[str | None, str | None]] = []
+        for pick in (youth.first_choice, youth.second_choice, youth.third_choice):
+            trimmed = pick.strip() if pick else ''
+            buddy_triples.append(
+                ((trimmed, name_to_center_full.get(trimmed)) if trimmed else (None, None)),
+            )
+
+        parents: list[tuple[str, str | None]] = []
+        for n in youth.parent_names_list:
+            piece = n.strip()
+            if not piece:
+                continue
+            p_center = name_to_center_full.get(piece)
+            if p_center is None:
+                p_center = youth_center
+            parents.append((piece, p_center))
+        sibling_entries: list[tuple[str, str | None]] = [
+            (piece, name_to_center_full.get(piece))
+            for n in youth.siblings_list
+            if (piece := n.strip())
+        ]
+
+        cell_bw = 0.96
+        for col in range(6):
+            bx = col + 0.02
+            outer = plt.Rectangle(
+                (bx, y_bottom), cell_bw, row_height, facecolor='none',
+                edgecolor='black', linewidth=0.6, clip_on=False,
+            )
+            ax.add_patch(outer)
+
+        # Name column — assigned center (not friend-cluster hue)
+        ncol = 0
+        if youth_center is not None and youth_center in center_color_map:
+            name_face: Any = center_color_map[youth_center]
+        else:
+            name_face = UNKNOWN_BG
+        nrect = plt.Rectangle(
+            (ncol + 0.025, y_bottom + 0.01 * row_height),
+            cell_bw - 0.01,
+            row_height * 0.88,
+            facecolor=name_face,
+            edgecolor='none',
+            clip_on=False,
+        )
+        ax.add_patch(nrect)
+        nt = _cell_text_color(_patch_rgba4(nrect))
+        ax.text(
+            ncol + 0.5,
+            y_bottom + row_height / 2,
+            youth.name,
+            ha='center',
+            va='center',
+            fontsize=fontsize_cell,
+            fontweight='600',
+            color=nt,
+            clip_on=False,
+        )
+
+        # Buddy columns — single stripe or empty cell (no interior fill when empty per plan)
+        inner_h = row_height * 0.92
+        y_pad = y_bottom + 0.04 * row_height
+        for buddy_col, (buddy_name, buddy_center) in zip((1, 2, 3), buddy_triples, strict=True):
+            if buddy_name:
+                draw_colored_stripes(buddy_col, y_pad, inner_h, [(buddy_name, buddy_center)])
+
+        # Parent column
+        pcol = 4
+        if parents:
+            sh = (row_height * 0.92) / len(parents)
+            y_in = y_bottom + 0.04 * row_height
+            draw_colored_stripes(pcol, y_in, sh, [(lab, cen) for lab, cen in parents])
+
+        # Siblings column
+        scol = 5
+        if sibling_entries:
+            sh = (row_height * 0.92) / len(sibling_entries)
+            y_in = y_bottom + 0.04 * row_height
+            draw_colored_stripes(scol, y_in, sh, [(lab, cen) for lab, cen in sibling_entries])
+
+    # Bold separators between friend clusters (full width including label column)
+    for ri in range(n_data - 1):
+        k0 = cohesion_key(ordered_rows[ri].name)
+        k1 = cohesion_key(ordered_rows[ri + 1].name)
+        if k0 != k1:
+            y_line = (n_data - 1 - ri) * row_height
+            ax.plot(
+                [LABEL_COL_LEFT, DATA_X1],
+                [y_line, y_line],
+                color='black',
+                linewidth=3.0,
+                solid_capstyle='butt',
+                clip_on=False,
+                zorder=15,
+            )
+
+    # Cluster id labels (C1, C2, …) centered vertically on each block
+    fontsize_cluster_badge = max(8, min(11, fontsize_cell + 1))
+    for start_ri, end_ri, ck in cluster_row_spans:
+        y_block_top = (n_data - 1 - start_ri) * row_height + row_height
+        y_block_bot = (n_data - 1 - end_ri) * row_height
+        y_mid = (y_block_top + y_block_bot) / 2.0
+        if ck is not None and ck in cluster_label_by_cohesion:
+            badge = f'C{cluster_label_by_cohesion[ck]}'
+        else:
+            badge = '—'
+        ax.text(
+            (LABEL_COL_LEFT + LABEL_COL_RIGHT) / 2,
+            y_mid,
+            badge,
+            ha='center',
+            va='center',
+            fontsize=fontsize_cluster_badge,
+            fontweight='bold',
+            color='0.15',
+            clip_on=False,
+            zorder=5,
+        )
+
+    ax.plot(
+        [LABEL_COL_RIGHT, LABEL_COL_RIGHT],
+        [0.0, legend_y0 + row_height],
+        color='0.35',
+        linewidth=1.0,
+        clip_on=False,
+        zorder=4,
+    )
+
+    fig.suptitle(
+        "Youth roster by friend cluster (name = your center; buddies / parent / siblings = that person's center; "
+        'thick lines separate clusters)',
+        fontsize=13,
+        y=0.985,
+    )
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    print(f'Cluster roster table saved to {output_path}')
 
 
 def analyze_clusters(
@@ -511,8 +973,19 @@ def analyze_clusters(
         return {'num_clusters': 0, 'avg_cohesion': 0.0, 'cluster_details': {}}
 
     if centers:
-        filename = f'cluster_analysis_{year}.png' if year else 'cluster_analysis.png'
-        visualize_cluster_distribution(clusters, cohesion, centers, solver, person_crew, youth_list, f'{output_dir}/{filename}')
+        analysis_name = f'cluster_analysis_{year}.png' if year else 'cluster_analysis.png'
+        roster_name = f'cluster_roster_{year}.png' if year else 'cluster_roster.png'
+        out_base = Path(output_dir)
+        visualize_cluster_distribution(clusters, cohesion, centers, solver, person_crew, youth_list, str(out_base / analysis_name))
+        render_cluster_roster_table(
+            clusters,
+            cohesion,
+            centers,
+            solver,
+            person_crew,
+            youth_list,
+            str(out_base / roster_name),
+        )
     else:
         print('Skipping cluster visualization: no centers available to plot against.')
 

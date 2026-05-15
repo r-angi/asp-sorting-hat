@@ -4,9 +4,10 @@ Two flows append to ``data/clean/historical_crews.csv``:
 
 - :func:`convert_crews_to_historical` — for the in-flight ``crews_{year}.csv``
   (the one used to seed the solver). Used to backfill prior years.
-- :func:`append_assignments_final_to_historical` — for the post-run
-  ``assignments_{year}_final.csv`` snapshot, after a human has finalized
-  manual edits.
+- :func:`append_assignments_final_to_historical` — for the archived
+  ``data/results/<year>/<vN>/assignments_<year>.csv`` snapshot (default slot
+  is ``v1`` per year, with ``2025`` defaulting to ``v2`` where the finalized
+  roster lives), after manual edits.
 
 Both write the same three-column shape: ``name``, ``crew_year``, ``is_adult``.
 The deduplication key is the row tuple itself, so re-runs are idempotent.
@@ -45,8 +46,19 @@ def convert_crews_to_historical(crews_path: str, year: int) -> None:
     pl.concat([existing_df, historical_df]).unique().write_csv(historical_path)
 
 
+def default_versioned_assignments_path(year: int, *, results_root: Path | str = './data/results') -> Path:
+    """Path to the default archival assignments workbook for ``year``.
+
+    Uses ``results/<year>/v1/assignments_<year>.csv``, except ``2025`` uses
+    ``v2`` (finalized roster) alongside solver output in ``v1``.
+    """
+    root = Path(results_root)
+    version = 'v2' if year == 2025 else 'v1'
+    return root / str(year) / version / f'assignments_{year}.csv'
+
+
 def assignments_final_to_historical_df(assignments_df: pl.DataFrame, year: int) -> pl.DataFrame:
-    """Map ``assignments_*_final.csv`` rows into ``historical_crews`` columns.
+    """Map assignments workbook rows into ``historical_crews`` columns.
 
     Rows with blank ``Crew`` are skipped (e.g. unassigned placeholders).
 
@@ -80,14 +92,14 @@ def append_assignments_final_to_historical(
     historical_path: str | Path | None = None,
     dry_run: bool = False,
 ) -> pl.DataFrame:
-    """Append rows from ``assignments_{year}_final.csv`` into ``historical_crews.csv``.
+    """Append rows from the versioned assignments workbook into ``historical_crews.csv``.
 
     De-duplicates on ``(name, crew_year, is_adult)`` after merge. When ``historical_path`` is
     missing, it is created with the new rows only (unless ``dry_run``).
 
     Args:
         year: Trip year appended to ``crew_year`` (e.g. crew ``F01`` → ``F01 2025``).
-        assignments_path: Optional path; default ``./data/results/assignments_{year}_final.csv``.
+        assignments_path: Optional path; default :func:`default_versioned_assignments_path`.
         historical_path: Optional path; default ``./data/clean/historical_crews.csv``.
         dry_run: If true, compute the merged frame but do not write.
 
@@ -98,9 +110,7 @@ def append_assignments_final_to_historical(
         FileNotFoundError: Assignments CSV is missing.
         ValueError: Missing required columns or invalid year.
     """
-    assign_path = (
-        Path(assignments_path) if assignments_path else Path('./data/results') / f'assignments_{year}_final.csv'
-    )
+    assign_path = Path(assignments_path) if assignments_path else default_versioned_assignments_path(year)
     hist_path = Path(historical_path) if historical_path else Path('./data/clean/historical_crews.csv')
 
     if not assign_path.is_file():

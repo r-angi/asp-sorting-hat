@@ -9,7 +9,15 @@ from src.data_loaders import get_historical_youth_leaders
 from src.historical import (
     append_assignments_final_to_historical,
     assignments_final_to_historical_df,
+    default_versioned_assignments_path,
 )
+
+
+def test_default_versioned_assignments_path_v1_overrides_2025_v2(tmp_path: Path) -> None:
+    base = tmp_path / 'results'
+    assert default_versioned_assignments_path(2024, results_root=base) == base / '2024' / 'v1' / 'assignments_2024.csv'
+    assert default_versioned_assignments_path(2026, results_root=base) == base / '2026' / 'v1' / 'assignments_2026.csv'
+    assert default_versioned_assignments_path(2025, results_root=base) == base / '2025' / 'v2' / 'assignments_2025.csv'
 
 
 def test_assignments_final_to_historical_df_roles_and_skip_blank_crew() -> None:
