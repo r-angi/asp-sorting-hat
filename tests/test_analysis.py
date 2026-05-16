@@ -2,7 +2,7 @@
 
 The full integration tests in ``test_crew_assignment.py`` cover normal use; this
 file isolates the empty-roster zero-safety contract so it stays explicit, plus
-the ``--no-reassignment`` path's behavior when the crews scaffold is empty.
+the ``--cluster-analysis-only`` path's behavior when the crews scaffold is empty.
 """
 
 from pathlib import Path
@@ -16,12 +16,15 @@ from main import (
     normalize_run_version_label,
 )
 from src.analysis import (
+    calculate_first_choice_same_center_pct_by_center,
     calculate_friend_choice_stats,
     calculate_friend_match_buckets,
     calculate_friend_scores,
+    calculate_youth_buddy_weights_by_name,
+    calculate_youth_total_buddy_weight_samples,
     synthesize_centers_from_assignments,
 )
-from src.clustering import analyze_clusters
+from src.clustering import analyze_clusters, merge_friend_clusters_into_assignments_csv
 from src.models import Center, Crew, Youth
 
 
@@ -102,6 +105,71 @@ def test_calculate_friend_match_buckets_ignores_cross_center_picks() -> None:
         'A': {0: 1, 1: 0, 2: 0, 3: 0},
         'B': {0: 1, 1: 0, 2: 0, 3: 0},
     }
+
+
+def test_first_choice_same_center_pct_by_center_matches_bucket_fixture() -> None:
+    centers = [Center(name='Fayette', crews=[Crew(name='F01')])]
+    youth_list = [
+        Youth(name='Anna', year='Fr', gender='F', history='N',
+              first_choice='Bob',  second_choice='Cara', third_choice='Dan'),
+        Youth(name='Bob',  year='So', gender='M', history='V',
+              first_choice='Anna', second_choice=None,   third_choice=None),
+        Youth(name='Cara', year='Jr', gender='F', history='V',
+              first_choice='Anna', second_choice=None,   third_choice=None),
+        Youth(name='Dan',  year='Sr', gender='M', history='N',
+              first_choice=None,   second_choice=None,   third_choice=None),
+    ]
+    person_crew: dict[tuple[str, str, str], int] = {
+        ('Anna', 'Fayette', 'F01'): 1,
+        ('Bob',  'Fayette', 'F01'): 1,
+        ('Cara', 'Fayette', 'F01'): 1,
+        ('Dan',  'Fayette', 'F01'): 1,
+    }
+    pct, cohort = calculate_first_choice_same_center_pct_by_center(_FakeSolver(), person_crew, youth_list, centers)
+    assert pct == {'Fayette': 75.0}
+    assert cohort == 75.0
+
+
+def test_total_buddy_weight_samples_match_expected_weights() -> None:
+    centers = [Center(name='Fayette', crews=[Crew(name='F01')])]
+    youth_list = [
+        Youth(name='Anna', year='Fr', gender='F', history='N',
+              first_choice='Bob', second_choice=None, third_choice=None),
+        Youth(name='Bob',  year='So', gender='M', history='V',
+              first_choice='Anna', second_choice=None, third_choice=None),
+    ]
+    person_crew: dict[tuple[str, str, str], int] = {
+        ('Anna', 'Fayette', 'F01'): 1,
+        ('Bob',  'Fayette', 'F01'): 1,
+    }
+    per_center, overall = calculate_youth_total_buddy_weight_samples(_FakeSolver(), person_crew, youth_list, centers)
+    assert sorted(overall) == sorted([4.0, 4.0])
+    assert sorted(per_center['Fayette']) == sorted([4.0, 4.0])
+
+
+def test_calculate_youth_buddy_weights_by_name_is_per_person_flat_dict() -> None:
+    centers = [Center(name='Fayette', crews=[Crew(name='F01')])]
+    youth_list = [
+        Youth(name='Anna', year='Fr', gender='F', history='N',
+              first_choice='Bob',  second_choice='Cara', third_choice='Dan'),
+        Youth(name='Bob',  year='So', gender='M', history='V',
+              first_choice='Anna', second_choice=None, third_choice=None),
+        Youth(name='Cara', year='Jr', gender='F', history='V',
+              first_choice='Anna', second_choice=None, third_choice=None),
+        Youth(name='Dan',  year='Sr', gender='M', history='N',
+              first_choice=None,   second_choice=None, third_choice=None),
+    ]
+    person_crew: dict[tuple[str, str, str], int] = {
+        ('Anna', 'Fayette', 'F01'): 1,
+        ('Bob',  'Fayette', 'F01'): 1,
+        ('Cara', 'Fayette', 'F01'): 1,
+        ('Dan',  'Fayette', 'F01'): 1,
+    }
+    weights = calculate_youth_buddy_weights_by_name(_FakeSolver(), person_crew, youth_list, centers)
+    assert weights['Anna'] == 7.0
+    assert weights['Bob'] == 4.0
+    assert weights['Cara'] == 4.0
+    assert weights['Dan'] == 0.0
 
 
 def test_synthesize_centers_from_assignments_groups_by_center_and_crew() -> None:
@@ -249,3 +317,130 @@ def test_analyze_clusters_handles_empty_centers(tmp_path: Path) -> None:
 
     assert result['num_clusters'] >= 1
     assert not list(tmp_path.glob('cluster_analysis_*.png'))
+
+
+def test_merge_friend_clusters_into_assignments_csv_adds_columns(
+    tmp_path: Path,
+) -> None:
+    """Youth rows get ``FriendCluster`` / ``FriendClusterId``; leaders stay blank."""
+    path = tmp_path / 'assignments_2099.csv'
+    rows = [
+        {
+            'Center': 'North', 'Crew': 'N1', 'Name': 'Alice', 'Role': 'Youth',
+            'Gender': 'F', 'Year': 'Fr', 'History': 'N',
+        },
+        {
+            'Center': 'North', 'Crew': 'N1', 'Name': 'Bob', 'Role': 'Youth',
+            'Gender': 'M', 'Year': 'So', 'History': 'V',
+        },
+        {
+            'Center': 'North', 'Crew': 'N1', 'Name': 'Coach Ray', 'Role': 'Adult',
+            'Gender': '', 'Year': '', 'History': '',
+        },
+    ]
+    pl.DataFrame(rows).write_csv(path)
+
+    cohesion = {'cluster_0': {'size': 2, 'center_distribution': {'North': 2}, 'cohesion_score': 1.0}}
+    merge_friend_clusters_into_assignments_csv(path, {'Alice': 0, 'Bob': 0}, cohesion)
+
+    restored = pl.read_csv(path)
+    assert 'BuddyWeight' not in restored.columns
+    alice = restored.filter(pl.col('Name') == 'Alice').row(0, named=True)
+    bob = restored.filter(pl.col('Name') == 'Bob').row(0, named=True)
+    coach = restored.filter(pl.col('Name') == 'Coach Ray').row(0, named=True)
+
+    assert alice['FriendCluster'] == 'C1' and str(alice['FriendClusterId']) == '0'
+    assert bob['FriendCluster'] == 'C1' and str(bob['FriendClusterId']) == '0'
+    assert coach['FriendCluster'] == '' and coach['FriendClusterId'] == ''
+
+
+def test_merge_friend_clusters_writes_buddy_weight_when_mapping_passed(tmp_path: Path) -> None:
+    path = tmp_path / 'z.csv'
+    pl.DataFrame(
+        [
+            {
+                'Center': 'North', 'Crew': 'N1', 'Name': 'Zed', 'Role': 'Youth',
+                'Gender': 'M', 'Year': 'Sr', 'History': 'V',
+            },
+        ],
+    ).write_csv(path)
+    cohesion = {'cluster_0': {'size': 1, 'center_distribution': {'North': 1}, 'cohesion_score': 1.0}}
+    merge_friend_clusters_into_assignments_csv(
+        path,
+        {'Zed': 0},
+        cohesion,
+        buddy_weights_by_name={'Zed': 7.0},
+    )
+    row = pl.read_csv(path).row(0, named=True)
+    assert row['BuddyWeight'] in ('7', 7)
+
+
+def test_merge_friend_clusters_orders_display_columns_by_cluster_size(tmp_path: Path) -> None:
+    path = tmp_path / 'workbook.csv'
+    pl.DataFrame(
+        [
+            {
+                'Center': 'South', 'Crew': 'S9', 'Name': 'Cara', 'Role': 'Youth',
+                'Gender': '', 'Year': '', 'History': '',
+            },
+            {
+                'Center': 'North', 'Crew': 'N1', 'Name': 'Alice', 'Role': 'Youth',
+                'Gender': '', 'Year': '', 'History': '',
+            },
+            {
+                'Center': 'North', 'Crew': 'N1', 'Name': 'Bob', 'Role': 'Youth',
+                'Gender': '', 'Year': '', 'History': '',
+            },
+        ],
+    ).write_csv(path)
+
+    cohesion = {
+        'cluster_0': {'size': 2, 'center_distribution': {'North': 2}, 'cohesion_score': 1.0},
+        'cluster_1': {'size': 1, 'center_distribution': {'South': 1}, 'cohesion_score': 1.0},
+    }
+    merge_friend_clusters_into_assignments_csv(path, {'Alice': 0, 'Bob': 0, 'Cara': 1}, cohesion)
+    restored = pl.read_csv(path)
+
+    assert 'BuddyWeight' not in restored.columns
+    alice = restored.filter(pl.col('Name') == 'Alice').row(0, named=True)
+    cara = restored.filter(pl.col('Name') == 'Cara').row(0, named=True)
+
+    assert alice['FriendCluster'] == 'C1'
+    assert cara['FriendCluster'] == 'C2'
+
+
+def test_merge_friend_clusters_into_assignments_csv_replaces_prior_columns(tmp_path: Path) -> None:
+    path = tmp_path / 'a.csv'
+    pl.DataFrame(
+        [
+            {
+                'Center': 'North', 'Crew': 'N1', 'Name': 'Ace', 'Role': 'Youth',
+                'Gender': '', 'Year': '', 'History': '',
+                'FriendCluster': 'junk', 'FriendClusterId': 'x',
+                'BuddyWeight': '99',
+            },
+        ],
+    ).write_csv(path)
+    cohesion = {'cluster_0': {'size': 1, 'center_distribution': {'North': 1}, 'cohesion_score': 1.0}}
+    merge_friend_clusters_into_assignments_csv(
+        path,
+        {'Ace': 0},
+        cohesion,
+        buddy_weights_by_name={'Ace': 6.0},
+    )
+    df = pl.read_csv(path)
+    row = df.row(0, named=True)
+    assert row['FriendCluster'] == 'C1' and str(row['FriendClusterId']) == '0'
+    assert row['BuddyWeight'] in ('6', 6)
+
+
+def test_merge_friend_clusters_no_op_when_cohesion_empty(tmp_path: Path) -> None:
+    path = tmp_path / 'b.csv'
+    body = (
+        'Center,Crew,Name,Role,Gender,Year,History\n'
+        'North,N1,Wren,Youth,F,Fr,N\n'
+    )
+    path.write_text(body)
+    merge_friend_clusters_into_assignments_csv(path, {}, {})
+
+    assert 'FriendCluster' not in path.read_text()

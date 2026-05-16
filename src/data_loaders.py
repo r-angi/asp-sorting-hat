@@ -23,7 +23,8 @@ from collections.abc import Iterable
 import polars as pl
 
 from src.config import CenterConfig
-from src.models import Adult, Center, Crew, Leader, PlacementMode, Youth, YoungAdult
+from src.historical import ensure_historical_leader_column
+from src.models import Adult, Center, Crew, Leader, PlacementMode, YoungAdult, Youth
 from src.schema import ALLOWED_HISTORY, GENDER_NORMALIZATION
 
 
@@ -95,10 +96,7 @@ def _index_preassigned_leaders(adult_crews: pl.DataFrame) -> CrewLeaderIndex:
     repeated ``filter`` calls in :func:`_build_crew_leaders`.
     """
     fully_assigned = adult_crews.filter(
-        pl.col('Center').is_not_null()
-        & (pl.col('Center') != '')
-        & pl.col('Crew').is_not_null()
-        & (pl.col('Crew') != '')
+        pl.col('Center').is_not_null() & (pl.col('Center') != '') & pl.col('Crew').is_not_null() & (pl.col('Crew') != '')
     )
     index: CrewLeaderIndex = {}
     for row in fully_assigned.iter_rows(named=True):
@@ -118,19 +116,12 @@ def _build_centers_from_index(index: CrewLeaderIndex) -> list[Center]:
     by_center: dict[str, list[tuple[str, list[Leader]]]] = {}
     for (center_name, crew_name), leaders in index.items():
         by_center.setdefault(center_name, []).append((crew_name, leaders))
-    return [
-        Center(name=name, crews=[Crew(name=cn, adults=ls) for cn, ls in crews])
-        for name, crews in by_center.items()
-    ]
+    return [Center(name=name, crews=[Crew(name=cn, adults=ls) for cn, ls in crews]) for name, crews in by_center.items()]
 
 
 def _build_crews_from_index(index: CrewLeaderIndex, center_name: str) -> list[Crew]:
     """All crews for a center using the prebuilt index, preserving CSV order."""
-    return [
-        Crew(name=crew_name, adults=leaders)
-        for (idx_center, crew_name), leaders in index.items()
-        if idx_center == center_name
-    ]
+    return [Crew(name=crew_name, adults=leaders) for (idx_center, crew_name), leaders in index.items() if idx_center == center_name]
 
 
 def _build_crews_for_center(
@@ -143,10 +134,7 @@ def _build_crews_for_center(
     Crews missing from the CSV get empty ``adults`` lists; the solver fills them.
     """
     prefix = center_name[0].upper()
-    return [
-        Crew(name=cn, adults=index.get((center_name, cn), []))
-        for cn in (f'{prefix}{i:02d}' for i in range(1, crew_count + 1))
-    ]
+    return [Crew(name=cn, adults=index.get((center_name, cn), [])) for cn in (f'{prefix}{i:02d}' for i in range(1, crew_count + 1))]
 
 
 def get_centers_from_adults_df(
@@ -171,9 +159,7 @@ def get_centers_from_adults_df(
     """
     adult_crews = _normalize_placement_columns(adult_crews)
     center_only_df = adult_crews.filter(
-        pl.col('Center').is_not_null()
-        & (pl.col('Center') != '')
-        & (pl.col('Crew').is_null() | (pl.col('Crew') == ''))
+        pl.col('Center').is_not_null() & (pl.col('Center') != '') & (pl.col('Crew').is_null() | (pl.col('Crew') == ''))
     )
     center_only_list: list[Leader] = [
         _build_leader(
@@ -185,10 +171,7 @@ def get_centers_from_adults_df(
         for row in center_only_df.iter_rows(named=True)
     ]
 
-    unassigned_df = adult_crews.filter(
-        (pl.col('Center').is_null() | (pl.col('Center') == ''))
-        & (pl.col('Crew').is_null() | (pl.col('Crew') == ''))
-    )
+    unassigned_df = adult_crews.filter((pl.col('Center').is_null() | (pl.col('Center') == '')) & (pl.col('Crew').is_null() | (pl.col('Crew') == '')))
     unassigned_list: list[Leader] = [
         _build_leader(
             row,
@@ -199,9 +182,7 @@ def get_centers_from_adults_df(
         for row in unassigned_df.iter_rows(named=True)
     ]
 
-    df_centers = {
-        c for c in adult_crews['Center'].unique().to_list() if c is not None and c != ''
-    }
+    df_centers = {c for c in adult_crews['Center'].unique().to_list() if c is not None and c != ''}
 
     leader_index = _index_preassigned_leaders(adult_crews)
 
@@ -230,19 +211,23 @@ def get_youth_from_buddy_form_df(youth: pl.DataFrame) -> list[Youth]:
 
 
 def get_historical_youth_leaders(all_historical_crews: pl.DataFrame) -> dict[str, list[str]]:
-    """Map each youth name to the list of adult leaders they crewed under historically.
+    """Map each youth name to past trip leaders they crewed under.
 
-    Deduplicates leader names per youth so a leader who crewed multiple years
-    appears once in ``past_leaders`` (matters for eligibility filtering).
+    Rows with ``is_leader`` label past leaders (drivers and Young Adults).
+
+    Uses rows where ``is_leader`` is true (stored leader flag, not buddy-roster youths).
+    Deduplicates leader names per youth so someone who crewed multiple years appears once
+    in ``past_leaders`` (matters for eligibility filtering).
     """
-    adult_df = all_historical_crews.filter(pl.col('is_adult')).drop('is_adult').rename({'name': 'adult_name'})
-    youth_df = all_historical_crews.filter(~pl.col('is_adult')).drop('is_adult').rename({'name': 'youth_name'})
+    hist_df = ensure_historical_leader_column(all_historical_crews)
+    leader_df = hist_df.filter(pl.col('is_leader')).drop('is_leader').rename({'name': 'leader_name'})
+    youth_df = hist_df.filter(~pl.col('is_leader')).drop('is_leader').rename({'name': 'youth_name'})
     youth_pairings_df = (
-        youth_df.join(adult_df, on='crew_year', how='left')
+        youth_df.join(leader_df, on='crew_year', how='left')
         .group_by('youth_name')
-        .agg(pl.col('adult_name').drop_nulls().unique().alias('adult_names'))
+        .agg(pl.col('leader_name').drop_nulls().unique().alias('leader_names'))
     )
-    return {row['youth_name']: row['adult_names'] for row in youth_pairings_df.iter_rows(named=True)}
+    return {row['youth_name']: row['leader_names'] for row in youth_pairings_df.iter_rows(named=True)}
 
 
 def all_parents_are_valid(youth_df: pl.DataFrame, adult_df: pl.DataFrame) -> bool:

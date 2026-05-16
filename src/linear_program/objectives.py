@@ -90,14 +90,14 @@ def add_friend_preference_objectives(ctx: ModelContext) -> list[ObjectiveTerm]:
     use ``cfg.adult_friend_weight`` (must be set).
 
     Weights:
-        First choice: 3, Second: 2, Third: 1.
+        First choice: 4, Second: 2, Third: 1.
     """
     cfg = ctx.cfg
     adult_w = cfg.adult_friend_weight
     assert adult_w is not None
 
     objective_terms: list[ObjectiveTerm] = []
-    weights = (3, 2, 1)
+    weights = (4, 2, 1)
 
     for youth in ctx.youth_list:
         choices = (youth.first_choice, youth.second_choice, youth.third_choice)

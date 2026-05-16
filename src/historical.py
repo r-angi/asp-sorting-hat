@@ -9,7 +9,7 @@ Two flows append to ``data/clean/historical_crews.csv``:
   is ``v1`` per year, with ``2025`` defaulting to ``v2`` where the finalized
   roster lives), after manual edits.
 
-Both write the same three-column shape: ``name``, ``crew_year``, ``is_adult``.
+Both write the same three-column shape: ``name``, ``crew_year``, ``is_leader``.
 The deduplication key is the row tuple itself, so re-runs are idempotent.
 """
 
@@ -19,7 +19,16 @@ from pathlib import Path
 import polars as pl
 
 
-def convert_crews_to_historical(crews_path: str, year: int) -> None:
+def ensure_historical_leader_column(df: pl.DataFrame) -> pl.DataFrame:
+    """Return a frame with ``is_leader`` present, accepting legacy ``is_adult`` header."""
+    if 'is_leader' in df.columns:
+        return df
+    if 'is_adult' in df.columns:
+        return df.rename({'is_adult': 'is_leader'})
+    raise ValueError(
+        "historical crews frame must include an 'is_leader' column (or legacy 'is_adult'); "
+        f"got columns {df.columns!r}"
+    )
     """Convert crews data to historical_crews format and append to ``historical_crews.csv``.
 
     Args:
@@ -31,18 +40,24 @@ def convert_crews_to_historical(crews_path: str, year: int) -> None:
 
     crews_df = pl.read_csv(crews_path)
 
-    historical_df = crews_df.with_columns(
-        [
-            pl.concat_str([pl.col('Crew'), pl.lit(str(year))], separator=' ').alias('crew_year'),
-            pl.when(pl.col('role') == 'Adult').then(pl.lit(True)).otherwise(pl.lit(False)).alias('is_adult'),
-        ]
-    ).select(['name', 'crew_year', 'is_adult'])
+    historical_df = (
+        crews_df.with_columns(
+            [
+                pl.concat_str([pl.col('Crew'), pl.lit(str(year))], separator=' ').alias('crew_year'),
+                pl.col('role')
+                .cast(pl.Utf8)
+                .str.strip_chars()
+                .is_in(['Adult', 'Young Adult'])
+                .alias('is_leader'),
+            ]
+        ).select(['name', 'crew_year', 'is_leader'])
+    )
 
     historical_path = './data/clean/historical_crews.csv'
     if not os.path.exists(historical_path):
         historical_df.write_csv(historical_path)
         return
-    existing_df = pl.read_csv(historical_path)
+    existing_df = ensure_historical_leader_column(pl.read_csv(historical_path))
     pl.concat([existing_df, historical_df]).unique().write_csv(historical_path)
 
 
@@ -62,8 +77,8 @@ def assignments_final_to_historical_df(assignments_df: pl.DataFrame, year: int) 
 
     Rows with blank ``Crew`` are skipped (e.g. unassigned placeholders).
 
-    Adults (``Role == 'Adult'``) become ``is_adult`` true; Youth and Young Adult are false,
-    consistent with :func:`convert_crews_to_historical`.
+    Trip leaders (``Role`` of ``Adult`` or ``Young Adult``) become ``is_leader`` true;
+    ``Youth`` is false, consistent with :func:`convert_crews_to_historical`.
     """
     required = {'Name', 'Crew', 'Role'}
     missing = required - set(assignments_df.columns)
@@ -81,8 +96,8 @@ def assignments_final_to_historical_df(assignments_df: pl.DataFrame, year: int) 
 
     return normalized.with_columns(
         pl.concat_str([pl.col('crew_str'), pl.lit(y)], separator=' ').alias('crew_year'),
-        (pl.col('role_clean') == 'Adult').alias('is_adult'),
-    ).select(pl.col('name_clean').alias('name'), pl.col('crew_year'), pl.col('is_adult'))
+        pl.col('role_clean').is_in(['Adult', 'Young Adult']).alias('is_leader'),
+    ).select(pl.col('name_clean').alias('name'), pl.col('crew_year'), pl.col('is_leader'))
 
 
 def append_assignments_final_to_historical(
@@ -94,7 +109,7 @@ def append_assignments_final_to_historical(
 ) -> pl.DataFrame:
     """Append rows from the versioned assignments workbook into ``historical_crews.csv``.
 
-    De-duplicates on ``(name, crew_year, is_adult)`` after merge. When ``historical_path`` is
+    De-duplicates on ``(name, crew_year, is_leader)`` after merge. When ``historical_path`` is
     missing, it is created with the new rows only (unless ``dry_run``).
 
     Args:
@@ -120,7 +135,7 @@ def append_assignments_final_to_historical(
     historical_df = assignments_final_to_historical_df(assignments_df, year)
 
     if hist_path.is_file():
-        existing_df = pl.read_csv(hist_path)
+        existing_df = ensure_historical_leader_column(pl.read_csv(hist_path))
         merged = pl.concat([existing_df, historical_df]).unique()
     else:
         merged = historical_df.unique()

@@ -111,6 +111,27 @@ def enforce_parent_crew_separation_constraint(ctx: ModelContext) -> None:
                     ctx.model.Add(picker + parent_var <= 1)
 
 
+def enforce_parent_center_constraint(ctx: ModelContext) -> None:
+    """Youth must land at the same center as any UNASSIGNED parent.
+
+    FIXED and CENTER_ONLY parents already pin the youth's allowed centers
+    upstream in :func:`lp_model._compute_eligibility`. Parents whose center is
+    still a solver decision (UNASSIGNED) need a runtime equation tying the
+    youth's per-center indicator to the parent's per-center presence so both
+    are forced to the same center.
+    """
+    for youth in ctx.youth_list:
+        for parent_name in youth.parent_names_list:
+            leader = ctx.leaders_by_name.get(parent_name)
+            if leader is None or leader.placement != PlacementMode.UNASSIGNED:
+                continue
+            for center in ctx.centers:
+                presence = adult_presence_at_center(leader, center, ctx.adult_crew)
+                if presence is None:
+                    continue
+                ctx.model.Add(ctx.at_center[(youth.name, center.name)] == presence)
+
+
 def enforce_friend_separation_constraint(ctx: ModelContext) -> None:
     """Buddy picks may not share a crew with the picker.
 

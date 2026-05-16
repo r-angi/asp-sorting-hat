@@ -164,9 +164,9 @@ def clean_historical_crews_old(historical_crew_path: str, year: int) -> None:
             name=pl.concat_str([pl.col('first_name'), pl.col('last_name')], separator=' '),
             crew_year=pl.concat_str([pl.col('Crew'), pl.lit(year)], separator=' '),
         )
-        .with_columns((pl.col('name') == pl.col('name').str.to_uppercase()).fill_null(False).alias('is_adult'))
+        .with_columns((pl.col('name') == pl.col('name').str.to_uppercase()).fill_null(False).alias('is_leader'))
         .with_columns(pl.col('name').str.replace(r'\s+', ' ').str.to_titlecase().str.strip_chars().alias('name'))
-        .select(['name', 'crew_year', 'is_adult'])
+        .select(['name', 'crew_year', 'is_leader'])
     )
     cleaned_historical_df.write_csv(f'./data/clean/historical_crews_{year}.csv')
 

@@ -29,8 +29,8 @@ class Config:
     max_adults_per_crew: int = 3
 
     # Objective weights
-    friend_weight: int = 2  # Weight for friend preferences
-    gender_weight: int = 1  # Weight for youth gender diversity
+    friend_weight: int = 3  # Weight for friend preferences
+    gender_weight: int = 2  # Weight for youth gender diversity
     year_weight: int = 1  # Weight for youth year diversity
     history_weight: int = 1  # Weight for youth vet/new diversity
     adult_gender_weight: int = 1  # Weight for adult-leader M/F balance per crew
@@ -67,7 +67,7 @@ class Config:
         return cls(
             friend_weight=4,
             adult_friend_weight=4,
-            gender_weight=1,
+            gender_weight=2,
             year_weight=1,
             history_weight=1,
         )
@@ -78,7 +78,7 @@ class Config:
         return cls(
             friend_weight=1,
             adult_friend_weight=1,
-            gender_weight=2,
+            gender_weight=4,
             year_weight=2,
             history_weight=2,
             center_gender_weight=2,

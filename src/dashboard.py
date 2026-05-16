@@ -10,7 +10,7 @@ as a precomputed mapping so the renderer never re-implements solver-side
 weighting.
 """
 
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -21,6 +21,28 @@ import numpy as np
 import polars as pl
 from matplotlib.axes import Axes
 from matplotlib.figure import Figure
+
+from src.analysis import (
+    build_placement_context_from_assignments_csv,
+    calculate_first_choice_same_center_pct_by_center,
+    calculate_youth_total_buddy_weight_samples,
+)
+from src.data_loaders import get_youth_from_buddy_form_df
+
+
+DEFAULT_CLEAN_DATA_DIR: Final[Path] = Path('./data/clean')
+
+
+def _resolve_buddies_workbook(assignments_csv: Path, year: int) -> Path | None:
+    """Locate ``buddies_{year}.csv`` beside the workbook, else under ``./data/clean``."""
+    for candidate in (
+        assignments_csv.with_name(f'buddies_{year}.csv'),
+        DEFAULT_CLEAN_DATA_DIR / f'buddies_{year}.csv',
+    ):
+        if candidate.is_file():
+            return candidate
+    return None
+
 
 YEAR_ORDER: Final[tuple[str, ...]] = ('Fr', 'So', 'Jr', 'Sr')
 GENDER_ORDER: Final[tuple[str, ...]] = ('F', 'M')
@@ -247,6 +269,10 @@ def render_center_dashboard(
     the count of youth at that center with that many same-center buddy matches
     (e.g. from :func:`calculate_friend_match_buckets`). When omitted the
     matches panel is dropped entirely (keeping the figure compact).
+
+    When ``buddy_match_counts`` is provided and ``buddies_{year}.csv`` is found
+    (same directory as the workbook, or ``./data/clean``), two extra panels
+    render first-choice same-center rates and smoothed per-youth buddy weights.
     """
     if not assignments_csv.is_file():
         raise FileNotFoundError(f'Assignments CSV not found: {assignments_csv}')
@@ -268,8 +294,31 @@ def render_center_dashboard(
         if buddy_match_counts is not None
         else None
     )
+
+    buddies_path = _resolve_buddies_workbook(assignments_csv, year)
+    buddy_extras: tuple[dict[str, float], float, dict[str, list[float]], list[float]] | None = None
+    if buddy_match_counts is not None and buddies_path is not None:
+        roster = get_youth_from_buddy_form_df(pl.read_csv(buddies_path))
+        solver, person_crew, centers_ctx = build_placement_context_from_assignments_csv(
+            assignments_df, roster, summary.centers,
+        )
+        first_pct, cohort_first = calculate_first_choice_same_center_pct_by_center(
+            solver, person_crew, roster, centers_ctx,
+        )
+        by_center_scores, overall_scores = calculate_youth_total_buddy_weight_samples(
+            solver, person_crew, roster, centers_ctx,
+        )
+        buddy_extras = (first_pct, cohort_first, by_center_scores, overall_scores)
+
     with apply_dashboard_style():
-        fig = _build_figure(summary, friend_scores or {}, buddy_str_counts, year, source=assignments_csv)
+        fig = _build_figure(
+            summary,
+            friend_scores or {},
+            buddy_str_counts,
+            year,
+            source=assignments_csv,
+            buddy_extras=buddy_extras,
+        )
         fig.savefig(output_path)
         plt.close(fig)
 
@@ -296,26 +345,39 @@ def _build_figure(
     buddy_match_counts: dict[str, dict[str, int]] | None,
     year: int,
     source: Path,
+    *,
+    buddy_extras: tuple[
+        Mapping[str, float],
+        float,
+        Mapping[str, Sequence[float]],
+        Sequence[float],
+    ] | None = None,
 ) -> Figure:
     has_buddy_panel = buddy_match_counts is not None
+    has_bottom = has_buddy_panel and buddy_extras is not None
     if has_buddy_panel:
-        mosaic = (
-            'HF\n'
-            'YB\n'
-            'GI'
-        )
+        mosaic = ('HF\n' 'YB\n' 'GI')
+        if has_bottom:
+            mosaic += '\nPW'
+        height_ratios: list[float] = [1.0, 1.05, 1.0]
+        fig_height = 13.0
+        hspace_top = 0.55
     else:
-        mosaic = (
-            'HF\n'
-            'YY\n'
-            'GI'
-        )
+        mosaic = ('HF\n' 'YY\n' 'GI')
+        height_ratios = [1.0, 1.05, 1.0]
+        fig_height = 13.0
+        hspace_top = 0.55
+
+    if has_bottom:
+        height_ratios.append(1.05)
+        fig_height = 16.0
+        hspace_top = 0.5
 
     fig, axes = plt.subplot_mosaic(
         mosaic,
-        figsize=(13.5, 13.0),
-        height_ratios=[1.0, 1.05, 1.0],
-        gridspec_kw={'hspace': 0.55, 'wspace': 0.22},
+        figsize=(13.5, fig_height),
+        height_ratios=height_ratios,
+        gridspec_kw={'hspace': hspace_top, 'wspace': 0.22},
     )
 
     _draw_headcount(axes['H'], summary)
@@ -340,6 +402,18 @@ def _build_figure(
             axes['B'], summary, buddy_match_counts,
             order=BUDDY_MATCH_ORDER, colors=BUDDY_MATCH_COLORS,
             title='Same-center buddy matches  ·  % of youth (0 to 3 friends together)',
+        )
+
+    if has_bottom and buddy_extras is not None:
+        first_pct_map, cohort_first_pct, by_center_lists, overall_list = buddy_extras
+        _draw_first_choice_same_center_bar(
+            axes['P'], summary, dict(first_pct_map), cohort_first_pct,
+        )
+        _draw_buddy_weight_kde(
+            ax=axes['W'],
+            centers=summary.centers,
+            by_center=by_center_lists,
+            overall=list(overall_list),
         )
 
     fig.suptitle(
@@ -557,4 +631,129 @@ def _draw_stacked_categories(
         ncol=len(order), frameon=False,
     )
 
+
+def _silverman_bandwidth_1d(samples: Sequence[float]) -> float:
+    arr = np.asarray(samples, dtype=float)
+    if arr.size < 2:
+        return 0.65
+    sigma = float(np.std(arr, ddof=1))
+    if sigma < 1e-6:
+        sigma = 0.45
+    n = float(arr.size)
+    return float(max(1.06 * sigma * (n ** (-1.0 / 5.0)), 0.38))
+
+
+def _gaussian_kde_pdf(grid: np.ndarray, samples: Sequence[float], bandwidth: float) -> np.ndarray:
+    arr = np.asarray(samples, dtype=float)
+    if arr.size == 0 or bandwidth <= 0:
+        return np.zeros_like(grid, dtype=float)
+    scaled = (grid[:, None] - arr[None, :]) / bandwidth
+    kernel_mean = np.exp(-0.5 * scaled ** 2).mean(axis=1)
+    coef = 1.0 / (bandwidth * np.sqrt(2.0 * np.pi))
+    return kernel_mean.astype(float) * coef
+
+
+def _draw_first_choice_same_center_bar(
+    ax: Axes,
+    summary: CenterSummary,
+    pct_by_center: dict[str, float],
+    cohort_pct: float,
+) -> None:
+    centers_l = summary.centers
+    x_idx = np.arange(len(centers_l))
+    heights = np.array([float(pct_by_center.get(cname, 0.0)) for cname in centers_l], dtype=float)
+    fill = ACCENT_PRIMARY
+    ax.bar(
+        x_idx,
+        heights,
+        width=0.62,
+        color=fill,
+        edgecolor=_darker(fill),
+        linewidth=0.55,
+        zorder=2,
+    )
+    ax.axhline(
+        cohort_pct,
+        color=REFERENCE_LINE,
+        linestyle='--',
+        linewidth=1.15,
+        zorder=1,
+        label=f'Overall {cohort_pct:.1f}%',
+    )
+    raw_max = max(float(heights.max()) if heights.size else 0.0, cohort_pct, 10.0)
+    ax.set_ylim(0, min(raw_max * 1.12, 105.0))
+
+    y_top = ax.get_ylim()[1]
+
+    pad = y_top * 0.015
+    for xi, h_val in enumerate(heights):
+        if h_val > 0:
+            ax.text(float(x_idx[xi]), float(h_val) + pad, f'{h_val:.1f}%', ha='center', va='bottom', fontsize=8.5)
+
+    ax.set_title('First buddy at same center · % of youth (roster 1st choice)')
+    ax.set_xticks(x_idx)
+    ax.set_xticklabels(centers_l)
+    ax.set_ylabel('% of youth at center')
+    ax.grid(axis='x', visible=False)
+    ax.margins(x=0.06)
+    ax.legend(loc='upper right', fontsize=8.5)
+
+
+def _draw_buddy_weight_kde(
+    ax: Axes,
+    centers: list[str],
+    by_center: Mapping[str, Sequence[float]],
+    overall: Sequence[float],
+) -> None:
+    cmap = plt.get_cmap('tab10')
+    grid = np.linspace(-0.35, 7.55, 320)
+
+    for i, center_name in enumerate(centers):
+        samples = list(by_center.get(center_name, ()))
+        if not samples:
+            continue
+        bw = _silverman_bandwidth_1d(samples)
+        kde = _gaussian_kde_pdf(grid, samples, bw)
+        color = cmap(i % cmap.N)
+        ax.fill_between(grid, kde, color=color, alpha=0.25, linewidth=0.0)
+        ax.plot(grid, kde, color=color, alpha=0.65, lw=1.15, label=center_name)
+
+    if overall:
+        bw_o = _silverman_bandwidth_1d(overall)
+        kde_overall = _gaussian_kde_pdf(grid, overall, bw_o)
+        ax.plot(
+            grid,
+            kde_overall,
+            color='#111111',
+            alpha=0.78,
+            lw=2.1,
+            label='Overall',
+            zorder=len(centers) + 2,
+        )
+        peak_mask = kde_overall > 1e-9
+        peak_seq: Sequence[bool] = [bool(v) for v in peak_mask.astype(bool)]
+        if any(peak_seq):
+            ax.fill_between(
+                grid,
+                kde_overall,
+                where=peak_seq,
+                color='#111111',
+                alpha=0.08,
+                linewidth=0.0,
+                zorder=len(centers) + 1,
+            )
+
+    ax.set_title(
+        'Total buddy preference weight · density (smooth, weights 4 + 2 + 1)',
+    )
+    ax.set_xlabel('Per-youth summed weight')
+    ax.set_ylabel('Density')
+    ax.set_xlim(grid[0], grid[-1])
+    ax.grid(axis='x', visible=True)
+    ax.legend(
+        loc='upper center',
+        bbox_to_anchor=(0.5, -0.12),
+        ncol=min(8, max(2, len(centers) // 4 + (2 if centers else 1))),
+        fontsize=8.5,
+    )
 

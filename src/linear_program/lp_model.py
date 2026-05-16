@@ -34,6 +34,7 @@ from src.linear_program.constraints import (
     enforce_friend_center_constraint,
     enforce_friend_separation_constraint,
     enforce_new_requires_vet,
+    enforce_parent_center_constraint,
     enforce_parent_crew_separation_constraint,
     enforce_sibling_center_constraint,
     enforce_sibling_crew_separation_constraint,
@@ -70,42 +71,53 @@ def _ya_fixed_crew(youth_name: str, centers: list[Center]) -> tuple[str, str] | 
     return None
 
 
-def _build_adult_to_center(
+def _build_leader_feasible_centers(
     centers: list[Center],
     center_only_adults: Sequence[Leader] | None = None,
-) -> dict[str, str]:
-    """Map leader names to a center: pre-placed crew adults, then center-only adults.
+    unassigned_adults: Sequence[Leader] | None = None,
+) -> dict[str, set[str]]:
+    """Map every leader name to the set of centers they could land at.
 
-    Parents on the crews CSV often have a fixed :class:`Center` but empty ``Crew``
-    (algorithm assigns their crew). Those leaders are not in ``crew.adults`` until
-    after the solve, but their ``fixed_center`` still pins where their children
-    may be placed.
+    - FIXED (pre-placed in ``crew.adults``) → ``{center.name}``.
+    - CENTER_ONLY (``fixed_center`` set, crew solver-decided) → ``{fixed_center}``.
+    - UNASSIGNED (no fixed center) → copy of every configured center (copied per
+      leader so entries are never accidentally aliased).
+
+    Used by :func:`_compute_eligibility` to intersect a youth's allowed centers
+    across all of their parents without raising on parents whose center is still
+    a solver decision.
     """
-    mapping: dict[str, str] = {}
+    all_centers = {c.name for c in centers}
+
+    feasible: dict[str, set[str]] = {}
     for center in centers:
         for crew in center.crews:
             for leader in crew.adults:
-                mapping[leader.name] = center.name
+                feasible[leader.name] = {center.name}
     for leader in center_only_adults or []:
         if leader.fixed_center is None:
             continue
-        mapping.setdefault(leader.name, leader.fixed_center)
-    return mapping
+        feasible.setdefault(leader.name, {leader.fixed_center})
+    for leader in unassigned_adults or []:
+        feasible.setdefault(leader.name, set(all_centers))
+    return feasible
 
 
 def _compute_eligibility(
     youth_list: list[Youth],
     centers: list[Center],
-    center_only_adults: Sequence[Leader] | None = None,
+    leader_feasible_centers: dict[str, set[str]],
 ) -> EligibilityMap:
     """Return ``{youth_name: [(center, crew), ...]}`` of legal placements per youth.
 
     Eligibility prunes ``(center, crew)`` pairs that hard constraints would force
     to zero anyway:
 
-    - **Parent center**: youth restricted to their parent's ``fixed_center``,
-      whether the parent is pre-placed in a specific crew or only pinned to a
-      center (the solver picks the crew).
+    - **Parent center**: youth restricted to the intersection of every parent's
+      feasible center set. FIXED / CENTER_ONLY parents contribute a single
+      center; UNASSIGNED parents contribute every center (the runtime
+      :func:`enforce_parent_center_constraint` ties youth-at-center to the
+      parent's solver-chosen center).
     - **Pre-placed parent's crew**: pruned here because the parent already lives
       in ``crew.adults``. For parents whose crew is still a solver decision the
       same rule is enforced at runtime by
@@ -122,8 +134,7 @@ def _compute_eligibility(
     ``add_one_crew_per_youth`` constraint).
     """
     youth_dict = {y.name: y for y in youth_list}
-    adult_to_center = _build_adult_to_center(centers, center_only_adults)
-    all_centers: frozenset[str] = frozenset(c.name for c in centers)
+    all_centers = {c.name for c in centers}
 
     allowed_centers: dict[str, set[str]] = {}
     for y in youth_list:
@@ -135,14 +146,15 @@ def _compute_eligibility(
             continue
 
         if y.parent_names_list:
-            parent_centers: set[str] = set()
+            parents_feasible: list[set[str]] = []
             for parent in y.parent_names_list:
-                if parent not in adult_to_center:
+                feasible = leader_feasible_centers.get(parent)
+                if feasible is None:
                     raise ValueError(
-                        f'Parent {parent!r} not found in any center for {y.name!r}'
+                        f'Parent {parent!r} not found among any leaders for {y.name!r}'
                     )
-                parent_centers.add(adult_to_center[parent])
-            allowed_centers[y.name] = parent_centers
+                parents_feasible.append(feasible)
+            allowed_centers[y.name] = set.intersection(*parents_feasible)
         else:
             allowed_centers[y.name] = set(all_centers)
 
@@ -294,7 +306,11 @@ def create_crew_assignment_model(
     model = cp_model.CpModel()
 
     centers_by_name = {c.name: c for c in centers}
-    eligibility = _compute_eligibility(youth_list, centers, flex_center_only)
+    eligibility = _compute_eligibility(
+        youth_list,
+        centers,
+        _build_leader_feasible_centers(centers, flex_center_only, flex_unassigned),
+    )
     person_crew = _build_person_crew(model, youth_list, eligibility)
     adult_crew = _build_adult_crew(
         model, centers, centers_by_name, flex_center_only, flex_unassigned
@@ -320,6 +336,7 @@ def create_crew_assignment_model(
 
     add_one_crew_per_youth(ctx)
     enforce_parent_crew_separation_constraint(ctx)
+    enforce_parent_center_constraint(ctx)
     enforce_sibling_center_constraint(ctx)
     enforce_sibling_crew_separation_constraint(ctx)
     enforce_friend_separation_constraint(ctx)

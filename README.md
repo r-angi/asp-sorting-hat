@@ -43,7 +43,7 @@ The system takes youth preferences (buddy forms) and assigns each youth to a cre
    - Anti-buddies cannot be at the same center (enforces separation)
 
 4. **Historical Constraints**
-   - Youth cannot be assigned to crews led by any of their past leaders (from `historical_crews.csv`)
+   - Youth cannot repeat under any **past leader** (`Adult` or `Young Adult` from `historical_crews.csv`) they already crewed with
 
 5. **Supervision Groups**
    - Maximum of 2 youth per center from each supervision group
@@ -55,8 +55,8 @@ The system optimizes multiple objectives with configurable weights:
 
 1. **Friend preferences (youth roster and leaders)** — `friend_weight` (default 2) / `adult_friend_weight` (defaults to `friend_weight`)
    - The "at least one pick at the youth's center" rule above is hard for both buddy-roster picks and leader picks; weights below are the soft tie-breaker that decides *which* of multiple eligible centers the solver prefers when freedom remains.
-   - **Youth / Young Adult on the buddy roster**: first / second / third choice in the same center earns +3 / +2 / +1 points (each multiplied by `friend_weight`).
-   - **Adult / Young Adult on `crews_YEAR.csv` only** (leader name used as a buddy pick): +3 / +2 / +1 points × `adult_friend_weight`. As above, both the same-center hard rule and the different-crew separation rule apply uniformly to leader picks.
+   - **Youth / Young Adult on the buddy roster**: first / second / third choice in the same center earns +4 / +2 / +1 points (each multiplied by `friend_weight`).
+   - **Adult / Young Adult on `crews_YEAR.csv` only** (leader name used as a buddy pick): +4 / +2 / +1 points × `adult_friend_weight`. As above, both the same-center hard rule and the different-crew separation rule apply uniformly to leader picks.
    - Young Adult buddy-form rows still use the youth path when the pick is another roster youth; leader picks use the adult path when the pick is not on the buddy roster.
    - Printed friend scores summarize youth-to-youth matches only (leader picks are enforced in the objective but omitted from that summary).
 
@@ -189,14 +189,18 @@ Pete Nichols,Kanawha,K01,Adult,V,M,
 
 ### 3. Historical Crews (`historical_crews.csv`)
 
-Contains past crew assignments for preventing repeat leader pairings.
+Optional. One row per person on past trips; the solver derives **`past_leaders`** per buddy-roster youth from leaders who shared the same **`crew_year`**. **`is_leader`** is **`true`** for both **Adult** and **Young Adult** roster rows (**`false`** for youth participants).
+
+If a workbook still labels that column **`is_adult`**, it is renamed to **`is_leader`** on load (unchanged booleans).
 
 **Example:**
+
 ```csv
-name,crew_year,is_adult
-John Smith,F01 2024,False
-Glenn Smith,F01 2024,True
-Jane Doe,K02 2023,False
+name,crew_year,is_leader
+John Smith,F01 2024,false
+Glenn Smith,F01 2024,true
+Alex Kim,F01 2024,true
+Jane Doe,K02 2023,false
 ```
 
 **Column descriptions:**
@@ -204,8 +208,26 @@ Jane Doe,K02 2023,False
 | Column | Required | Description |
 |--------|----------|-------------|
 | name | Yes | Full name |
-| crew_year | Yes | Crew and year (e.g., "F01 2024") |
-| is_adult | Yes | True if person was an adult leader, False if youth |
+| crew_year | Yes | Crew plus trip year (e.g. `F01 2024`) |
+| is_leader | Yes | **`true`** for trip leaders (**Adult** / **Young Adult**) used in **`past_leaders`**; **`false`** for roster youth |
+
+#### Refreshing history after a trip
+
+Append rows into `data/clean/historical_crews.csv` (deduped **`name`** + **`crew_year`** + **`is_leader`**).
+
+**From solver output** (`assignments_<year>.csv` defaults: **2025 → `v2`**, others → **`v1`** unless you override):
+
+```bash
+python scripts/append_assignments_to_historical.py --year Y
+# Optional: --assignments path/to/file.csv --historical path/to/historical_crews.csv --dry-run
+```
+
+**Vendor raw roster** (`data/raw/historical_crews_<year>_raw.csv`, various column layouts):
+
+```bash
+python scripts/import_historical_raw_crews.py --year Y        # preview
+python scripts/import_historical_raw_crews.py --year Y --write
+```
 
 ## Output
 
@@ -215,25 +237,11 @@ Under that folder, `main.py` writes:
 
 - **`assignments_{YEAR}.csv`** — roster with columns: `Center`, `Crew`, `Name`, `Role`, `Gender`, `Year`, `History` (adult rows echo leader metadata when known)
 - **`center_dashboard_{YEAR}.png`** — dashboard figure (every successful solve)
+- **`cluster_analysis_{YEAR}.png`** — friend cluster visualization (every successful solve by default; pass **`--no-cluster-analysis`** on a full solve to skip)
 
-With **`--analyze-clusters`**, it also writes **`cluster_analysis_{YEAR}.png`** in the same version folder.
-
-**Re-analysis (`--no-reassignment`)** reads **`data/results/<YEAR>/<version>/assignments_{YEAR}.csv`** (see [Usage](#usage)) and regenerates dashboard and cluster visuals there.
-
-The history merge script defaults to the same versioned layout (see `scripts/append_assignments_to_historical.py` and `src.historical.default_versioned_assignments_path`).
+**Re-analysis** (**`--cluster-analysis-only`**) reads **`data/results/<YEAR>/<version>/assignments_{YEAR}.csv`** (see [Usage](#usage)), prints friend scores, and regenerates the dashboard and cluster visuals in that folder.
 
 Console output still includes center/crew breakdowns, diversity and friend-fulfillment summaries, and friend scores.
-
-### Refreshing history after a trip
-
-After you finalize assignments for year Y:
-
-```bash
-python scripts/append_assignments_to_historical.py --year Y
-# Optional: --assignments path/to/file.csv --historical path/to/historical_crews.csv --dry-run
-```
-
-By default the script reads **`data/results/<YEAR>/v1/assignments_<YEAR>.csv`** (year **2025** uses **`v2`** unless you override with **`--assignments`**). This appends de-duplicated rows to `data/clean/historical_crews.csv` in the same shape as the existing file.
 
 ## Configuration
 
@@ -261,8 +269,8 @@ Factory helpers:
 
 ### Versioned results and `--version`
 
-- **Normal solve:** outputs go to **`data/results/<year>/vN/`** with the next free `N` (`v1`, `v2`, …). Do not pass **`--version`** here; the CLI rejects it without **`--no-reassignment`**.
-- **Re-analysis:** **`--no-reassignment`** requires **`--version`** to pick the run folder. Accepts e.g. **`v1`**, **`1`**, or **`V2`** (normalized to `v1`, `v2`, …). It loads **`data/results/<year>/<version>/assignments_<year>.csv`**, prints assignments, and regenerates the dashboard and cluster plots in that same folder.
+- **Normal solve:** outputs go to **`data/results/<year>/vN/`** with the next free `N` (`v1`, `v2`, …). Do not pass **`--version`** here; the CLI rejects it without **`--cluster-analysis-only`**.
+- **Re-analysis:** **`--cluster-analysis-only`** requires **`--version`** to pick the run folder. Accepts e.g. **`v1`**, **`1`**, or **`V2`** (normalized to `v1`, `v2`, …). It loads **`data/results/<year>/<version>/assignments_<year>.csv`**, prints assignments and friend scores, and regenerates the dashboard and cluster plots in that same folder.
 
 ### Basic usage
 
@@ -281,25 +289,30 @@ python main.py -y 2026 --centers Fayette Kanawha Nicholas Leslie
 python main.py -y 2026 --centers Fayette:11 Kanawha Nicholas:11 Leslie
 
 # Re-score an existing run (no solver): --version selects data/results/<year>/vN/
-python main.py -y 2026 --no-reassignment --version v1
-python main.py -y 2026 --no-reassignment --version 2   # same as --version v2
+python main.py -y 2026 --cluster-analysis-only --version v1
+python main.py -y 2026 --cluster-analysis-only --version 2   # same as --version v2
 
-# One sweep after a full solve: dashboard always; clusters when flag is set
-python main.py -y 2026 --centers Fayette:11 Kanawha:12 --analyze-clusters
+# Full solve: dashboard + cluster PNGs run by default
+python main.py -y 2026 --centers Fayette:11 Kanawha:12
 
-# Rebuild dashboard + cluster PNGs for a locked v1 run only
-python main.py -y 2026 --no-reassignment --version v1
+# Skip cluster detection / cluster PNG on a full solve only (dashboard still runs)
+python main.py -y 2026 --no-cluster-analysis
+
+# Rebuild dashboard + cluster PNGs for a locked v1 run (manual / curated workbook)
+python main.py -y 2026 --cluster-analysis-only --version v1
 ```
 
 ### Cluster analysis
 
-On a **full solve**, **`--analyze-clusters`** enables friend cluster detection and visualization:
+On a **full solve**, friend cluster detection and visualization run **by default**:
 
 - Detects friend communities using the Louvain method
 - Evaluates how clusters were split across centers given the assignments
 - Writes **`cluster_analysis_{YEAR}.png`** under **`data/results/<YEAR>/vN/`** for that run
 
-With **`--no-reassignment`**, cluster analysis always runs (no extra flag) using the CSV in the **`--version`** folder.
+Pass **`--no-cluster-analysis`** to skip cluster output (dashboard and printed friend scores still run). **`--analyze-clusters`** remains accepted for backward compatibility but is redundant (hidden from **`--help`**).
+
+With **`--cluster-analysis-only`**, cluster analysis always runs using the CSV in the **`--version`** folder.
 
 ## Feature summary
 
@@ -310,5 +323,5 @@ With **`--no-reassignment`**, cluster analysis always runs (no extra flag) using
 - **Supervision groups** — Cap youth per group per center
 - **Anti-buddy lists** — Keep named youth at different centers
 - **Validation & normalization** — `validate_clean_data` and `crew_csv_normalize` for repeatable data prep
-- **History merge script** — Append finalized assignments into `historical_crews.csv`
-- **Versioned runs** — each solve writes under `data/results/<year>/vN/`; `--no-reassignment --version vN` re-reads that folder and refreshes dashboard and cluster outputs
+- **History** — Refresh `historical_crews.csv` after a trip (assignments CSV or vendor raw); see [Refreshing history after a trip](#refreshing-history-after-a-trip)
+- **Versioned runs** — each solve writes under `data/results/<year>/vN/`; `--cluster-analysis-only --version vN` re-reads that folder and refreshes dashboard and cluster outputs

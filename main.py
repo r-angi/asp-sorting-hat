@@ -2,10 +2,11 @@
 
 Two paths:
 
-1. ``python main.py -y 2026`` — build the CP-SAT model and solve.
-2. ``python main.py -y 2026 --no-reassignment --version v1`` — skip the solver
-   and re-score ``data/results/<year>/vN/assignments_<year>.csv`` for dashboard /
-   cluster output (PNG exports are regenerated in that same ``vN`` folder).
+1. ``python main.py -y 2026`` — build the CP-SAT model and solve; friend cluster
+   analysis and PNGs run by default (pass ``--no-cluster-analysis`` to skip).
+2. ``python main.py -y 2026 --cluster-analysis-only --version v1`` — skip the solver and re-score
+   ``data/results/<year>/vN/assignments_<year>.csv`` for dashboard / cluster
+   output (PNG exports are regenerated in that same ``vN`` folder).
 
 Fresh solver writes land under ``data/results/<year>/vN`` with the next unused
 integer ``N`` (``v1``, ``v2``, …).
@@ -64,9 +65,7 @@ def normalize_run_version_label(version_arg: str) -> str:
     m_v = re.fullmatch(r'[vV](\d+)', raw)
     if m_v:
         return f'v{int(m_v.group(1), 10)}'
-    raise ValueError(
-        f'Invalid version {version_arg!r}; expected e.g. v1 or 1.'
-    )
+    raise ValueError(f'Invalid version {version_arg!r}; expected e.g. v1 or 1.')
 
 
 def allocate_next_versioned_run_dir(results_base: Path, year: int) -> Path:
@@ -102,9 +101,7 @@ class AssignmentsLookup:
 
     def Value(self, var: object) -> int:
         if not isinstance(var, int):
-            raise TypeError(
-                'AssignmentsLookup.Value only accepts ints from the precomputed assignments dict'
-            )
+            raise TypeError('AssignmentsLookup.Value only accepts ints from the precomputed assignments dict')
         return var
 
 
@@ -124,16 +121,14 @@ def load_assignments_from_csv(
         raise FileNotFoundError(
             f'Assignments CSV not found: {assignments_csv}. '
             'Solve first to populate data/results/<year>/vN/assignments_<year>.csv, '
-            'or pass matching --year and --no-reassignment --version vN.'
+            'or pass matching --year and --cluster-analysis-only --version vN.'
         )
     assignments_df = pl.read_csv(assignments_csv).with_columns(
         pl.col('Center').cast(pl.Utf8, strict=False),
         pl.col('Crew').cast(pl.Utf8, strict=False),
     )
     youth_names = {y.name for y in youth_list}
-    valid_pairs = {
-        (center.name, crew.name) for center in centers for crew in center.crews
-    }
+    valid_pairs = {(center.name, crew.name) for center in centers for crew in center.crews}
 
     assigned: dict[tuple[str, str, str], int] = {}
     for row in assignments_df.iter_rows(named=True):
@@ -169,7 +164,7 @@ def analyze_existing_assignments(
 ) -> None:
     """Re-score placements from ``results/<year>/<version>/assignments_<year>.csv`` without solving."""
     print('\n' + '=' * 50)
-    print('ANALYZING EXISTING ASSIGNMENTS (--no-reassignment)')
+    print('ANALYZING EXISTING ASSIGNMENTS (--cluster-analysis-only)')
     print('=' * 50)
 
     run_root = results_root / str(year) / version_label
@@ -200,7 +195,15 @@ def analyze_existing_assignments(
     )
 
     regular_youth = [y for y in youth_list if y.role == 'Youth']
-    analyze_clusters(regular_youth, solver, person_crew, effective_centers, year=year, output_dir=str(run_root))
+    analyze_clusters(
+        regular_youth,
+        solver,
+        person_crew,
+        effective_centers,
+        year=year,
+        output_dir=str(run_root),
+        assignments_csv=assignments_csv,
+    )
 
     _print_friend_scores(solver, person_crew, youth_list, effective_centers)
 
@@ -227,7 +230,11 @@ def run_optimization(
     cfg = cfg or Config.default()
 
     model, person_crew, adult_crew = create_crew_assignment_model(
-        cfg, youth_list, centers, center_only_adults, unassigned_adults,
+        cfg,
+        youth_list,
+        centers,
+        center_only_adults,
+        unassigned_adults,
     )
 
     solver = _configure_solver(cfg)
@@ -276,7 +283,15 @@ def run_optimization(
 
     if analyze_clusters_flag:
         regular_youth = [y for y in youth_list if y.role == 'Youth']
-        analyze_clusters(regular_youth, solver, person_crew, centers, year=year, output_dir=str(run_dir))
+        analyze_clusters(
+            regular_youth,
+            solver,
+            person_crew,
+            centers,
+            year=year,
+            output_dir=str(run_dir),
+            assignments_csv=run_dir / f'assignments_{year}.csv',
+        )
 
     _print_friend_scores(solver, person_crew, youth_list, centers)
 
@@ -294,13 +309,26 @@ def main() -> None:
     parser.add_argument(
         '--centers', nargs='*', help='Center specifications in format "CenterName:CrewCount" or "CenterName" (e.g., Fayette:11 Kanawha:12)'
     )
-    parser.add_argument('--analyze-clusters', action='store_true', help='Run friend cluster analysis and generate visualization')
     parser.add_argument(
-        '--no-reassignment',
+        '--no-cluster-analysis',
+        action='store_true',
+        help=(
+            'On a full solver run only: skip friend cluster detection and cluster PNG output '
+            '(dashboard and friend-score printing still run). Cannot be combined with '
+            '--cluster-analysis-only.'
+        ),
+    )
+    parser.add_argument(
+        '--analyze-clusters',
+        action='store_true',
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        '--cluster-analysis-only',
         action='store_true',
         help=(
             'Skip optimization; read data/results/<year>/<version>/assignments_<year>.csv '
-            'and regenerate dashboard + cluster visuals in that folder (requires --version).'
+            'and regenerate dashboard + cluster visuals + friend scores in that folder (requires --version).'
         ),
     )
     parser.add_argument(
@@ -309,8 +337,8 @@ def main() -> None:
         default=None,
         type=_parse_cli_run_version,
         help=(
-            'With --no-reassignment: subdirectory under data/results/<year>/, e.g. v1 or 2 (required there). '
-            'Ignored during a normal solver run.'
+            'With --cluster-analysis-only: subdirectory under data/results/<year>/, '
+            'e.g. v1 or 2 (required there). Ignored during a normal solver run.'
         ),
     )
 
@@ -318,14 +346,23 @@ def main() -> None:
 
     year = args.year
     center_specs = args.centers
-    analyze_clusters_flag = args.analyze_clusters
-    no_reassignment = args.no_reassignment
+    cluster_analysis_only = args.cluster_analysis_only
+    analyze_clusters_flag = not args.no_cluster_analysis
 
-    if args.version is not None and not no_reassignment:
-        parser.error('--version is only used with --no-reassignment.')
+    if args.version is not None and not cluster_analysis_only:
+        parser.error('--version is only used with --cluster-analysis-only.')
 
-    if no_reassignment and args.version is None:
-        parser.error('--no-reassignment requires --version (e.g. --version v1).')
+    if cluster_analysis_only and args.version is None:
+        parser.error('--cluster-analysis-only requires --version (e.g. --version v1).')
+
+    if cluster_analysis_only and args.no_cluster_analysis:
+        parser.error(
+            '--no-cluster-analysis applies only to full solver runs; '
+            'omit it when using --cluster-analysis-only.'
+        )
+
+    if args.analyze_clusters and args.no_cluster_analysis:
+        parser.error('Cannot combine --analyze-clusters with --no-cluster-analysis.')
 
     center_configs = None
     if center_specs:
@@ -371,13 +408,17 @@ def main() -> None:
     if unassigned_adults:
         print(f'Unassigned leaders (algorithm assigns center & crew): {len(unassigned_adults)}')
 
-    if no_reassignment:
+    if cluster_analysis_only:
         retro_label = args.version
         assert retro_label is not None
         analyze_existing_assignments(year, youth_list, centers, version_label=retro_label)
     else:
         run_optimization(
-            year, youth_list, centers, center_only_adults, unassigned_adults,
+            year,
+            youth_list,
+            centers,
+            center_only_adults,
+            unassigned_adults,
             analyze_clusters_flag,
         )
 

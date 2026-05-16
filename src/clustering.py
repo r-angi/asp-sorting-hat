@@ -1,18 +1,39 @@
 from collections import defaultdict
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, cast
 
 import matplotlib.pyplot as plt
 from matplotlib import colormaps
-from matplotlib.colors import to_rgba
+from matplotlib.colors import LinearSegmentedColormap, to_rgba
 import networkx as nx  # type: ignore[import-untyped]
 import numpy as np
+import polars as pl
 from community import community_louvain  # type: ignore
 
-from src.analysis import PersonCrew, SolverLike, build_name_to_center, is_person_at_center
+from src.analysis import (
+    PersonCrew,
+    SolverLike,
+    build_name_to_center,
+    calculate_youth_buddy_weights_by_name,
+    is_person_at_center,
+)
 from src.models import Center, Youth
 
-__all__ = ('is_person_at_center', 'analyze_clusters', 'detect_friend_clusters')
+__all__ = (
+    'is_person_at_center',
+    'analyze_clusters',
+    'detect_friend_clusters',
+    'merge_friend_clusters_into_assignments_csv',
+)
+
+
+# Roster PNG + workbook: summed same-center roster buddy weights (4 + 2 + 1 max 7).
+_MAX_PER_YOUTH_BUDDY_WEIGHT: float = 7.0
+_SCORE_SURFACE_CMAP = LinearSegmentedColormap.from_list(
+    'buddy_weight_seq',
+    ['#f7fafc', '#d6e8f5', '#4a7598', '#1a4470'],
+)
 
 
 def _cmap_lut_rgba(cmap_key: str, n_colors: int) -> np.ndarray:
@@ -84,12 +105,98 @@ def detect_friend_clusters(youth_list: list[Youth]) -> dict[str, int]:
 
     for youth in youth_list:
         G.add_node(youth.name)
-        weights = {youth.first_choice: 3, youth.second_choice: 2, youth.third_choice: 1}
+        weights = {youth.first_choice: 4, youth.second_choice: 2, youth.third_choice: 1}
         for friend, weight in weights.items():
             if friend and friend in roster:
                 G.add_edge(youth.name, friend, weight=weight)
 
     return community_louvain.best_partition(G, weight='weight')
+
+
+def _friend_cluster_column_maps(
+    clusters: dict[str, int],
+    cohesion: dict[str, dict[str, Any]],
+) -> tuple[dict[str, str], dict[str, str]]:
+    """Map youth name → (viz-style label ``C{N}``, Louvain id string).
+
+    ``N`` ranks clusters by descending size — same convention as :func:`render_cluster_roster_table`.
+    """
+    cluster_sizes = sorted(cohesion.items(), key=lambda x: x[1]['size'], reverse=True)
+    cluster_keys_ordered = [cid for cid, _ in cluster_sizes]
+    label_rank = {ck: i + 1 for i, ck in enumerate(cluster_keys_ordered)}
+    display_by_name: dict[str, str] = {}
+    raw_by_name: dict[str, str] = {}
+    for name, nid in clusters.items():
+        key = f'cluster_{nid}'
+        rank = label_rank.get(key)
+        if rank is None:
+            continue
+        display_by_name[name] = f'C{rank}'
+        raw_by_name[name] = str(nid)
+    return display_by_name, raw_by_name
+
+
+def merge_friend_clusters_into_assignments_csv(
+    path: Path | str,
+    clusters: dict[str, int],
+    cohesion: dict[str, dict[str, Any]],
+    buddy_weights_by_name: Mapping[str, float] | None = None,
+) -> None:
+    """Add or replace ``FriendCluster`` / ``FriendClusterId`` (+ optional ``BuddyWeight``).
+
+    Leader rows (anything other than role ``Youth``) get empty strings — friend
+    clusters apply to roster youth only (:func:`detect_friend_clusters` input
+    matches :func:`analyze_clusters`).
+
+    ``BuddyWeight`` holds the summed same-center roster buddy preference weights
+    (4+2+1) when ``buddy_weights_by_name`` is supplied; otherwise that column is
+    omitted entirely.
+    """
+    if not cohesion:
+        return
+    csv_path = Path(path)
+    if not csv_path.is_file():
+        return
+
+    df = pl.read_csv(csv_path)
+    extra_cols = {'FriendCluster', 'FriendClusterId', 'BuddyWeight'}
+    drop_existing = [c for c in df.columns if c in extra_cols]
+    if drop_existing:
+        df = df.drop(drop_existing)
+
+    display_map, raw_map = _friend_cluster_column_maps(clusters, cohesion)
+
+    friend_cluster: list[str] = []
+    friend_cluster_id: list[str] = []
+    buddy_weights_col: list[str] | None = [] if buddy_weights_by_name is not None else None
+    for row in df.iter_rows(named=True):
+        role = row.get('Role')
+        role_str = str(role).strip() if role is not None else ''
+        name = row.get('Name')
+        name_str = str(name).strip() if name is not None else ''
+        if role_str != 'Youth':
+            friend_cluster.append('')
+            friend_cluster_id.append('')
+            if buddy_weights_col is not None:
+                buddy_weights_col.append('')
+            continue
+        friend_cluster.append(display_map.get(name_str, ''))
+        friend_cluster_id.append(raw_map.get(name_str, ''))
+        if buddy_weights_col is not None:
+            assert buddy_weights_by_name is not None
+            wt = buddy_weights_by_name.get(name_str)
+            buddy_weights_col.append('' if wt is None else str(int(round(wt))))
+
+    out_series: list[pl.Series] = [
+        pl.Series('FriendCluster', friend_cluster, dtype=pl.Utf8),
+        pl.Series('FriendClusterId', friend_cluster_id, dtype=pl.Utf8),
+    ]
+    if buddy_weights_col is not None:
+        out_series.append(pl.Series('BuddyWeight', buddy_weights_col, dtype=pl.Utf8))
+
+    out = df.with_columns(out_series)
+    out.write_csv(csv_path)
+    print(f'Assignments workbook updated with friend cluster columns: {csv_path}')
 
 
 def calculate_cluster_cohesion(
@@ -136,7 +243,7 @@ def _build_friend_graph(youth_list: list[Youth]) -> nx.DiGraph:
     for youth in youth_list:
         G.add_node(youth.name)
         choices = [
-            (youth.first_choice, 3),
+            (youth.first_choice, 4),
             (youth.second_choice, 2),
             (youth.third_choice, 1),
         ]
@@ -479,9 +586,10 @@ def visualize_cluster_distribution(
         # Draw each cluster group within this center
         for partition_id, members_of_partition in sorted_clusters:
             cluster_label_vis: str
+            stripe_color: Any
             # Get cluster label and color
             if partition_id != -1 and partition_id in cluster_color_map:
-                color = cluster_color_map[partition_id]
+                stripe_color = cluster_color_map[partition_id]
                 cluster_label_candidate: str | None = None
                 for ck_idx, cohesion_key_ck in enumerate(cluster_ids):
                     if int(cohesion_key_ck.split('_')[1]) == partition_id:
@@ -489,7 +597,7 @@ def visualize_cluster_distribution(
                         break
                 cluster_label_vis = cluster_label_candidate or 'C?'
             else:
-                color = 'lightgray'
+                stripe_color = 'lightgray'
                 cluster_label_vis = 'Other'
 
             # Cluster sub-header
@@ -518,7 +626,7 @@ def visualize_cluster_distribution(
                     (x_base, y_current - box_height / 2),
                     center_box_width,
                     box_height,
-                    facecolor=color,
+                    facecolor=stripe_color,
                     edgecolor='black',
                     linewidth=0.5,
                     transform=ax_centers.transAxes,
@@ -580,8 +688,15 @@ def render_cluster_roster_table(
     person_crew: PersonCrew,
     youth_list: list[Youth],
     output_path: str = 'cluster_roster.png',
+    *,
+    buddy_weights: Mapping[str, float] | None = None,
 ) -> None:
-    """One row per youth, grouped by friend cluster: name cell = assigned center; cluster id on the left."""
+    """One row per youth, grouped by friend cluster.
+
+    Layout: Louvain cluster badge (far left); narrow summed buddy-weight cell
+    (same-center roster 4/2/1); then roster columns ending with name-colored
+    by assigned center.
+    """
     if not centers or not youth_list:
         print(f'Skipping {output_path}: roster table requires at least one center and one youth.')
         return
@@ -623,7 +738,13 @@ def render_cluster_roster_table(
 
     LABEL_COL_LEFT = -0.52
     LABEL_COL_RIGHT = 0.0
-    DATA_X1 = 6.0
+    SCORE_X0 = 0.03
+    DATA_REGION_ORIGIN = 0.26
+    DATA_X1 = DATA_REGION_ORIGIN + 6.0 + 0.04
+
+    def cell_col_x0(col_idx: int) -> float:
+        """Left inset for roster column ``col_idx`` (0=name, …, 5=siblings)."""
+        return DATA_REGION_ORIGIN + float(col_idx) + 0.02
 
     fig = plt.figure(figsize=(fig_width, fig_height_in))
     ax = fig.add_axes((0.04, 0.03, 0.92, 0.93))
@@ -677,7 +798,7 @@ def render_cluster_roster_table(
         clip_on=False,
     )
     n_cent = len(center_names)
-    grid_left = LABEL_COL_RIGHT
+    grid_left = DATA_REGION_ORIGIN
     grid_w = DATA_X1 - grid_left
     if n_cent:
         slot_w = grid_w / n_cent
@@ -746,8 +867,32 @@ def render_cluster_roster_table(
         clip_on=False,
     )
 
+    # Buddy-weight narrow header (summed roster same-center picks; max 7)
+    sc_w_header = DATA_REGION_ORIGIN - SCORE_X0 - 0.01
+    s_head = plt.Rectangle(
+        (SCORE_X0, header_y0 + 0.02 * row_height),
+        max(0.05, sc_w_header),
+        row_height * 0.96,
+        facecolor='#E8F0F6',
+        edgecolor='black',
+        linewidth=0.8,
+        clip_on=False,
+    )
+    ax.add_patch(s_head)
+    ax.text(
+        SCORE_X0 + max(0.05, sc_w_header) / 2,
+        header_y0 + row_height / 2,
+        'Wt',
+        ha='center',
+        va='center',
+        fontsize=max(8, fontsize_header - 3),
+        fontweight='bold',
+        color='0.2',
+        clip_on=False,
+    )
+
     for col, title in enumerate(headers):
-        bx = col + 0.02
+        bx = cell_col_x0(col)
         bw = 0.96
         rect = plt.Rectangle(
             (bx, header_y0 + 0.02 * row_height),
@@ -778,7 +923,7 @@ def render_cluster_roster_table(
         names_with_centers: list[tuple[str, str | None]],
     ) -> None:
         """Draw vertically stacked stripes in one cell."""
-        bx = col + 0.02
+        bx = cell_col_x0(col)
         bw = 0.96
         if not names_with_centers:
             return
@@ -835,9 +980,48 @@ def render_cluster_roster_table(
             if (piece := n.strip())
         ]
 
+        wt_val = buddy_weights.get(youth.name) if buddy_weights is not None else None
+        score_w_eff = DATA_REGION_ORIGIN - SCORE_X0 - 0.01
+        pad_inner = y_bottom + 0.02 * row_height
+        inner_score_h = row_height * 0.92
+        score_label = '—'
+        if buddy_weights is None:
+            sw_fill: Any = '#EEEEEE'
+        elif wt_val is None:
+            sw_fill = UNKNOWN_BG
+        else:
+            t_norm = float(min(max(wt_val, 0.0), _MAX_PER_YOUTH_BUDDY_WEIGHT))
+            rgba_tpl = tuple(_SCORE_SURFACE_CMAP(0.12 + (t_norm / _MAX_PER_YOUTH_BUDDY_WEIGHT) * 0.82))
+            sw_fill = (float(rgba_tpl[0]), float(rgba_tpl[1]), float(rgba_tpl[2]), 1.0)
+            score_label = str(int(round(float(wt_val))))
+
+        sq = plt.Rectangle(
+            (SCORE_X0, pad_inner),
+            score_w_eff,
+            inner_score_h,
+            facecolor=sw_fill,
+            edgecolor='black',
+            linewidth=0.55,
+            clip_on=False,
+        )
+        ax.add_patch(sq)
+        sr, sg, sb, _sa = _patch_rgba4(sq)
+        score_txt_clr = _cell_text_color((sr, sg, sb, _sa))
+        ax.text(
+            SCORE_X0 + score_w_eff / 2.0,
+            y_bottom + row_height / 2.0,
+            score_label,
+            ha='center',
+            va='center',
+            fontsize=max(7, fontsize_cell - 2),
+            fontweight='700',
+            color=score_txt_clr,
+            clip_on=False,
+        )
+
         cell_bw = 0.96
         for col in range(6):
-            bx = col + 0.02
+            bx = cell_col_x0(col)
             outer = plt.Rectangle(
                 (bx, y_bottom), cell_bw, row_height, facecolor='none',
                 edgecolor='black', linewidth=0.6, clip_on=False,
@@ -846,13 +1030,14 @@ def render_cluster_roster_table(
 
         # Name column — assigned center (not friend-cluster hue)
         ncol = 0
+        cx_name = cell_col_x0(ncol)
         if youth_center is not None and youth_center in center_color_map:
             name_face: Any = center_color_map[youth_center]
         else:
             name_face = UNKNOWN_BG
         nrect = plt.Rectangle(
-            (ncol + 0.025, y_bottom + 0.01 * row_height),
-            cell_bw - 0.01,
+            (cx_name + 0.02, y_bottom + 0.01 * row_height),
+            cell_bw - 0.035,
             row_height * 0.88,
             facecolor=name_face,
             edgecolor='none',
@@ -861,7 +1046,7 @@ def render_cluster_roster_table(
         ax.add_patch(nrect)
         nt = _cell_text_color(_patch_rgba4(nrect))
         ax.text(
-            ncol + 0.5,
+            cx_name + cell_bw / 2,
             y_bottom + row_height / 2,
             youth.name,
             ha='center',
@@ -940,11 +1125,20 @@ def render_cluster_roster_table(
         clip_on=False,
         zorder=4,
     )
+    ax.plot(
+        [DATA_REGION_ORIGIN, DATA_REGION_ORIGIN],
+        [0.0, legend_y0 + row_height],
+        color='0.35',
+        linewidth=1.0,
+        clip_on=False,
+        zorder=4,
+    )
 
     fig.suptitle(
-        "Youth roster by friend cluster (name = your center; buddies / parent / siblings = that person's center; "
-        'thick lines separate clusters)',
-        fontsize=13,
+        'Youth roster by friend cluster (Wt = summed same-center buddy weight 0–7; '
+        "name column = assigned center color; buddies / parent / siblings = that person's center; "
+        'thick rules separate clusters)',
+        fontsize=12.5,
         y=0.985,
     )
     plt.savefig(output_path, dpi=150, bbox_inches='tight')
@@ -959,8 +1153,16 @@ def analyze_clusters(
     centers: list[Center],
     year: int | None = None,
     output_dir: str = '.',
+    *,
+    assignments_csv: Path | str | None = None,
 ) -> dict[str, Any]:
-    """Full cluster analysis pipeline."""
+    """Full cluster analysis pipeline.
+
+    When ``assignments_csv`` points to an existing workbook, friend cluster ids are written to
+    that file as ``FriendCluster`` (``C1``, ``C2``, … ordered by roster size — same numbering as the
+    cluster roster visualization), ``FriendClusterId`` (Louvain partition id strings), and
+    ``BuddyWeight`` (summed same-center roster buddy preference weight 4+2+1, when placements exist).
+    """
     print('\n' + '=' * 50)
     print('CLUSTER ANALYSIS')
     print('=' * 50)
@@ -972,7 +1174,9 @@ def analyze_clusters(
         print('No friend clusters detected (empty youth list).')
         return {'num_clusters': 0, 'avg_cohesion': 0.0, 'cluster_details': {}}
 
+    buddy_weights: dict[str, float] | None = None
     if centers:
+        buddy_weights = calculate_youth_buddy_weights_by_name(solver, person_crew, youth_list, centers)
         analysis_name = f'cluster_analysis_{year}.png' if year else 'cluster_analysis.png'
         roster_name = f'cluster_roster_{year}.png' if year else 'cluster_roster.png'
         out_base = Path(output_dir)
@@ -985,6 +1189,7 @@ def analyze_clusters(
             person_crew,
             youth_list,
             str(out_base / roster_name),
+            buddy_weights=buddy_weights,
         )
     else:
         print('Skipping cluster visualization: no centers available to plot against.')
@@ -997,6 +1202,11 @@ def analyze_clusters(
     print('\nCluster Details:')
     for cluster_id, data in sorted(cohesion.items(), key=lambda x: x[1]['size'], reverse=True):
         print(f'  {cluster_id}: {data["size"]} members, cohesion={data["cohesion_score"]:.1%}, distribution={data["center_distribution"]}')
+
+    if assignments_csv is not None:
+        merge_friend_clusters_into_assignments_csv(
+            assignments_csv, clusters, cohesion, buddy_weights_by_name=buddy_weights,
+        )
 
     return {
         'num_clusters': num_clusters,

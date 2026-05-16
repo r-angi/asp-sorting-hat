@@ -36,12 +36,12 @@ def test_assignments_final_to_historical_df_roles_and_skip_blank_crew() -> None:
     crew_years = sorted(out.get_column("crew_year").unique().sort().to_list())
     assert crew_years == ["C01 2030", "C02 2030"]
 
-    adults = out.filter(pl.col("is_adult"))
-    assert adults.height == 2
-    assert set(adults.get_column("name").to_list()) == {"B Lee", "Dee Adult"}
+    adults = out.filter(pl.col("is_leader"))
+    assert adults.height == 3
+    assert set(adults.get_column("name").to_list()) == {"B Lee", "Dee Adult", "C Ya"}
 
-    youth_like = out.filter(~pl.col("is_adult"))
-    assert youth_like.height == 2
+    youth_like = out.filter(~pl.col("is_leader"))
+    assert youth_like.height == 1
     assert "Skip Me" not in youth_like.get_column("name").to_list()
 
 
@@ -69,7 +69,7 @@ def test_assignments_merge_idempotent(tmp_path: Path) -> None:
         dry_run=False,
     )
 
-    key = ["name", "crew_year", "is_adult"]
+    key = ["name", "crew_year", "is_leader"]
     assert merged1.sort(key).equals(merged2.sort(key))
     assert merged1.height == 2
     reread = pl.read_csv(hist)
@@ -81,7 +81,7 @@ def test_append_assignments_dry_run_does_not_write(tmp_path: Path) -> None:
     assign.write_text("Center,Crew,Name,Role\nX,C01,A,Youth\n")
 
     hist = tmp_path / "historical_crews.csv"
-    hist.write_text("name,crew_year,is_adult\nBob,C99 2020,false\n")
+    hist.write_text("name,crew_year,is_leader\nBob,C99 2020,false\n")
     unchanged = hist.read_text()
 
     append_assignments_final_to_historical(

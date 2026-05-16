@@ -8,16 +8,14 @@ values rather than crashing) and avoid the previously quadratic
 
 from collections import defaultdict
 from collections.abc import Sequence
-from typing import Any, Protocol, TypedDict
+from typing import Any, Protocol, TypedDict, cast
 
 import polars as pl
 from ortools.sat.python import cp_model
 
 from src.models import Center, Crew, Leader, Youth
 
-type PersonCrew = (
-    dict[tuple[str, str, str], cp_model.IntVar] | dict[tuple[str, str, str], int]
-)
+type PersonCrew = dict[tuple[str, str, str], cp_model.IntVar] | dict[tuple[str, str, str], int]
 
 
 class SolverLike(Protocol):
@@ -30,6 +28,17 @@ class SolverLike(Protocol):
     """
 
     def Value(self, var: Any) -> int: ...
+
+
+class WorkbookAssignmentsSolver:
+    """CP-SAT-free adapter: workbook ``person_crew`` ints pass through unchanged."""
+
+    def Value(self, var: Any) -> int:
+        if not isinstance(var, int):
+            raise TypeError(
+                'WorkbookAssignmentsSolver.Value only accepts ints from workbook-derived placements',
+            )
+        return var
 
 
 class CenterSummary(TypedDict):
@@ -68,7 +77,7 @@ def synthesize_centers_from_assignments(
 ) -> list[Center]:
     """Reconstruct a minimal ``list[Center]`` topology from a placed ``person_crew``.
 
-    Used by the ``--no-reassignment`` analysis path when the crews-CSV scaffold is
+    Used by the ``--cluster-analysis-only`` analysis path when the crews-CSV scaffold is
     absent (e.g. every leader is ``CENTER_ONLY`` so :func:`get_centers_from_adults_df`
     returns ``[]``) but a saved assignments workbook supplies the placements.
     The returned crews carry no leaders; only ``center.name`` and
@@ -78,10 +87,44 @@ def synthesize_centers_from_assignments(
     for (_name, center_name, crew_name), value in person_crew.items():
         if value == 1 and center_name and crew_name:
             by_center[center_name].add(crew_name)
-    return [
-        Center(name=cname, crews=[Crew(name=crew_name) for crew_name in sorted(crews)])
-        for cname, crews in sorted(by_center.items())
+    return [Center(name=cname, crews=[Crew(name=crew_name) for crew_name in sorted(crews)]) for cname, crews in sorted(by_center.items())]
+
+
+def build_placement_context_from_assignments_csv(
+    assignments_df: pl.DataFrame,
+    youth_list: Sequence[Youth],
+    centers_ordered: list[str],
+) -> tuple[WorkbookAssignmentsSolver, PersonCrew, list[Center]]:
+    """Rebuild solver-like placement tuples from youth rows aligned with workbook centers.
+
+    Center order follows ``centers_ordered`` so axes match :func:`compute_center_summary`.
+    """
+    roster = {y.name for y in youth_list}
+    placements: dict[tuple[str, str, str], int] = {}
+    crews_at: dict[str, set[str]] = defaultdict(set)
+
+    youth_rows = assignments_df.filter(pl.col('Role') == 'Youth')
+    for row in youth_rows.iter_rows(named=True):
+        name_cell, center_cell, crew_cell = row['Name'], row['Center'], row['Crew']
+        if name_cell is None or center_cell is None or crew_cell is None:
+            continue
+        name = str(name_cell)
+        if name not in roster:
+            continue
+        center = str(center_cell)
+        crew_nm = str(crew_cell)
+        placements[(name, center, crew_nm)] = 1
+        crews_at[center].add(crew_nm)
+
+    centers_objs: list[Center] = [
+        Center(
+            name=cname,
+            crews=[Crew(name=crew_nm) for crew_nm in sorted(crews_at.get(cname, set()))],
+        )
+        for cname in centers_ordered
     ]
+
+    return WorkbookAssignmentsSolver(), cast(PersonCrew, placements), centers_objs
 
 
 def is_person_at_center(
@@ -105,7 +148,7 @@ def is_person_at_center(
 
 
 _CHOICES_AND_WEIGHTS: tuple[tuple[str, int], ...] = (
-    ('first_choice', 3),
+    ('first_choice', 4),
     ('second_choice', 2),
     ('third_choice', 1),
 )
@@ -119,8 +162,9 @@ def calculate_friend_scores(
 ) -> tuple[dict[str, float], float]:
     """Per-center normalized friend score and overall average.
 
-    Weights: 1st / 2nd / 3rd choice = +3 / +2 / +1 when both youth land at the
-    same center. Non-roster (leader) picks are ignored here; the solver
+    Weights: 1st / 2nd / 3rd choice = +4 / +2 / +1 when both youth land at the
+    same center (same relative weights as :func:`add_friend_preference_objectives`).
+    Non-roster (leader) picks are ignored here; the solver
     objective already accounts for them.
     """
     empty_centers = {c.name: 0.0 for c in centers}
@@ -142,17 +186,12 @@ def calculate_friend_scores(
             if friend and friend in youth_dict and name_to_center.get(friend) == my_center:
                 center_scores[my_center] += weight
 
-    normalized = {
-        name: round(center_scores[name] / count, 2) if count > 0 else 0.0
-        for name, count in center_count.items()
-    }
+    normalized = {name: round(center_scores[name] / count, 2) if count > 0 else 0.0 for name, count in center_count.items()}
     avg_score = round(sum(center_scores.values()) / len(youth_list), 2)
     return normalized, avg_score
 
 
-def calculate_historical_friend_scores(
-    centers: list[Center], year: int
-) -> tuple[dict[str, float], float]:
+def calculate_historical_friend_scores(centers: list[Center], year: int) -> tuple[dict[str, float], float]:
     """Compute friend-preference scores for the *manual* roster in ``crews_{year}.csv``.
 
     Used to baseline a hand-edited assignment against the solver's output. Same
@@ -164,11 +203,7 @@ def calculate_historical_friend_scores(
     joined = youth_df.join(buddies_df, on='name', how='left')
 
     valid_centers = {c.name for c in centers}
-    name_to_center: dict[str, str] = {
-        row['name']: row['Center']
-        for row in joined.iter_rows(named=True)
-        if row['Center'] in valid_centers
-    }
+    name_to_center: dict[str, str] = {row['name']: row['Center'] for row in joined.iter_rows(named=True) if row['Center'] in valid_centers}
     if not name_to_center:
         return {c.name: 0.0 for c in centers}, 0.0
 
@@ -187,10 +222,7 @@ def calculate_historical_friend_scores(
                 center_scores[my_center] += weight
                 overall_score += weight
 
-    normalized = {
-        name: round(center_scores[name] / count, 2) if count > 0 else 0.0
-        for name, count in center_count.items()
-    }
+    normalized = {name: round(center_scores[name] / count, 2) if count > 0 else 0.0 for name, count in center_count.items()}
     avg_score = round(overall_score / len(name_to_center), 2)
     return normalized, avg_score
 
@@ -232,6 +264,117 @@ def calculate_friend_choice_stats(
     }
 
 
+def calculate_first_choice_same_center_pct_by_center(
+    solver: SolverLike,
+    person_crew: PersonCrew,
+    youth_list: Sequence[Youth],
+    centers: list[Center],
+) -> tuple[dict[str, float], float]:
+    """Per-center % of placed youth whose first-choice *roster* buddy shares their center."""
+    pct_map: dict[str, float] = {c.name: 0.0 for c in centers}
+    if not youth_list or not centers:
+        return pct_map, 0.0
+
+    name_to_center = build_name_to_center(solver, person_crew, centers)
+    youth_dict = {y.name: y for y in youth_list}
+
+    placed_center_count: dict[str, int] = {c.name: 0 for c in centers}
+    match_center_count: dict[str, int] = {c.name: 0 for c in centers}
+    cohort_placed = 0
+    cohort_first_match = 0
+
+    for youth in youth_list:
+        my_center = name_to_center.get(youth.name)
+        if my_center is None:
+            continue
+
+        cohort_placed += 1
+        buddy = youth.first_choice
+        if buddy and buddy in youth_dict and name_to_center.get(buddy) == my_center:
+            cohort_first_match += 1
+
+        if my_center not in placed_center_count:
+            continue
+
+        placed_center_count[my_center] += 1
+        if buddy and buddy in youth_dict and name_to_center.get(buddy) == my_center:
+            match_center_count[my_center] += 1
+
+    cohort_pct = round(cohort_first_match / cohort_placed * 100, 1) if cohort_placed else 0.0
+
+    for c in centers:
+        n = placed_center_count[c.name]
+        pct_map[c.name] = round(match_center_count[c.name] / n * 100, 1) if n else 0.0
+
+    return pct_map, cohort_pct
+
+
+def calculate_youth_total_buddy_weight_samples(
+    solver: SolverLike,
+    person_crew: PersonCrew,
+    youth_list: Sequence[Youth],
+    centers: list[Center],
+) -> tuple[dict[str, list[float]], list[float]]:
+    """Histogram samples: weighted sum (:data:`_CHOICES_AND_WEIGHTS`) per placed youth."""
+    lists_by_center: dict[str, list[float]] = {c.name: [] for c in centers}
+    overall_scores: list[float] = []
+
+    if not youth_list or not centers:
+        return lists_by_center, overall_scores
+
+    name_to_center = build_name_to_center(solver, person_crew, centers)
+    youth_dict = {y.name: y for y in youth_list}
+
+    for youth in youth_list:
+        my_center = name_to_center.get(youth.name)
+        if my_center is None:
+            continue
+        total_weight = 0
+        for choice_attr, weight in _CHOICES_AND_WEIGHTS:
+            friend = getattr(youth, choice_attr)
+            if friend and friend in youth_dict and name_to_center.get(friend) == my_center:
+                total_weight += weight
+
+        score = float(total_weight)
+        overall_scores.append(score)
+        if my_center in lists_by_center:
+            lists_by_center[my_center].append(score)
+
+    return lists_by_center, overall_scores
+
+
+def calculate_youth_buddy_weights_by_name(
+    solver: SolverLike,
+    person_crew: PersonCrew,
+    youth_list: Sequence[Youth],
+    centers: list[Center],
+) -> dict[str, float]:
+    """Map each roster youth → summed same-center buddy preference weight (4+2+1).
+
+    Mirrors :func:`calculate_youth_total_buddy_weight_samples`: only roster-youth
+    choices count; leader picks omitted; unplaced youths are skipped.
+    """
+    by_name: dict[str, float] = {}
+    if not youth_list or not centers:
+        return by_name
+
+    name_to_center = build_name_to_center(solver, person_crew, centers)
+    youth_dict = {y.name: y for y in youth_list}
+
+    for youth in youth_list:
+        my_center = name_to_center.get(youth.name)
+        if my_center is None:
+            continue
+        total_weight = 0
+        for choice_attr, weight in _CHOICES_AND_WEIGHTS:
+            friend = getattr(youth, choice_attr)
+            if friend and friend in youth_dict and name_to_center.get(friend) == my_center:
+                total_weight += weight
+        by_name[youth.name] = float(total_weight)
+
+    return by_name
+
+
 BUDDY_MATCH_BUCKETS: tuple[int, ...] = (0, 1, 2, 3)
 
 
@@ -249,9 +392,7 @@ def calculate_friend_match_buckets(
     :func:`calculate_friend_choice_stats`). Youth without an assigned center are
     skipped, so summed bucket counts equal the placed-youth headcount.
     """
-    result: dict[str, dict[int, int]] = {
-        c.name: dict.fromkeys(BUDDY_MATCH_BUCKETS, 0) for c in centers
-    }
+    result: dict[str, dict[int, int]] = {c.name: dict.fromkeys(BUDDY_MATCH_BUCKETS, 0) for c in centers}
     if not youth_list or not centers:
         return result
 
@@ -303,8 +444,7 @@ def print_crew_assignments(
             crew_youth = [
                 youth.name
                 for youth in youth_list
-                if (youth.name, center.name, crew.name) in person_crew
-                and solver.Value(person_crew[youth.name, center.name, crew.name]) == 1
+                if (youth.name, center.name, crew.name) in person_crew and solver.Value(person_crew[youth.name, center.name, crew.name]) == 1
             ]
             preassigned_adults = [a.name for a in crew.adults]
             flex_adults: list[str] = []

@@ -133,6 +133,41 @@ def test_render_center_dashboard_writes_png_with_buddy_match_counts(
     sample_assignments_df.write_csv(csv_path)
     out_path = tmp_path / 'center_dashboard_2099.png'
 
+    pl.DataFrame(
+        [
+            {
+                'name': 'Anna', 'history': 'N', 'gender': 'F', 'year': 'Fr',
+                'first_choice': 'Bob', 'second_choice': '', 'third_choice': '',
+                'siblings': '', 'parent_name': '', 'supervision_group': '', 'anti_buddy': '',
+            },
+            {
+                'name': 'Bob', 'history': 'V', 'gender': 'M', 'year': 'So',
+                'first_choice': 'Anna', 'second_choice': '', 'third_choice': '',
+                'siblings': '', 'parent_name': '', 'supervision_group': '', 'anti_buddy': '',
+            },
+            {
+                'name': 'Cara', 'history': 'V', 'gender': 'F', 'year': 'Jr',
+                'first_choice': 'Dan', 'second_choice': '', 'third_choice': '',
+                'siblings': '', 'parent_name': '', 'supervision_group': '', 'anti_buddy': '',
+            },
+            {
+                'name': 'Dan', 'history': 'N', 'gender': 'M', 'year': 'Sr',
+                'first_choice': 'Elle', 'second_choice': '', 'third_choice': '',
+                'siblings': '', 'parent_name': '', 'supervision_group': '', 'anti_buddy': '',
+            },
+            {
+                'name': 'Elle', 'history': 'V', 'gender': 'F', 'year': 'So',
+                'first_choice': '', 'second_choice': '', 'third_choice': '',
+                'siblings': '', 'parent_name': '', 'supervision_group': '', 'anti_buddy': '',
+            },
+            {
+                'name': 'Finn', 'history': 'N', 'gender': 'M', 'year': 'Fr',
+                'first_choice': 'Elle', 'second_choice': '', 'third_choice': '',
+                'siblings': '', 'parent_name': '', 'supervision_group': '', 'anti_buddy': '',
+            },
+        ],
+    ).write_csv(tmp_path / 'buddies_2099.csv')
+
     render_center_dashboard(
         assignments_csv=csv_path,
         output_path=out_path,

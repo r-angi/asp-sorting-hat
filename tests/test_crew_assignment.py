@@ -477,7 +477,7 @@ def test_objectives_scored(
         
         if youth.first_choice and youth.first_choice in youth_dict:
             if assignments[youth.first_choice][0] == youth_center:
-                friend_score += 3
+                friend_score += 4
         if youth.second_choice and youth.second_choice in youth_dict:
             if assignments[youth.second_choice][0] == youth_center:
                 friend_score += 2

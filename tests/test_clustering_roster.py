@@ -80,6 +80,7 @@ def test_render_cluster_roster_writes_nonempty_png(tmp_path: Path) -> None:
         person_crew,
         youth_list,
         str(out_file),
+        buddy_weights={'Alice': 4.0, 'Bob': 0.0, 'Charlie': 0.0},
     )
 
     assert out_file.is_file()
